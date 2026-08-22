@@ -922,4 +922,13 @@ mod tests {
 }
 
 
-fn main()
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([W, H])
+            .with_resizable(false)
+            .with_title("表情面板"),
+        ..Default::default()
+    };
+    eframe::run_native("表情面板", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
