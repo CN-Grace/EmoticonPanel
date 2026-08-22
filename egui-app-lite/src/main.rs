@@ -132,7 +132,8 @@ struct App {
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     // 后台解码: 固定 worker 池 (MPMC)
-    job_tx: crossbeam_channel::Sender<(PathBuf, Job, Vec<u8>)>,
+    job_static_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
+    job_anim_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
     done_rx: std::sync::mpsc::Receiver<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     done_tx: std::sync::mpsc::Sender<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     tex_seq: u64,
@@ -152,25 +153,35 @@ impl App {
         let root = core::root_dir();
         let packages = core::list_packages(&root);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let (job_tx, job_rx) = crossbeam_channel::bounded::<(PathBuf, Job, Vec<u8>)>(64);
-        // 固定 worker 池 (3 线程)
+        // 动画任务独立小队列, 优先于静态洪水
+        let (anim_tx, anim_rx) = crossbeam_channel::bounded::<(PathBuf, Vec<u8>)>(16);
+        let (static_tx, static_rx) = crossbeam_channel::bounded::<(PathBuf, Vec<u8>)>(128);
+        // 固定 worker 池 (3 线程), anim 优先
         for _ in 0..MAX_INFLIGHT {
-            let rx = job_rx.clone();
+            let arx = anim_rx.clone();
+            let srx = static_rx.clone();
             let tx = done_tx.clone();
             std::thread::spawn(move || {
-                while let Ok((path, job, bytes)) = rx.recv() {
-                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || match job {
-                        Job::Static => (decode_static(&bytes).map(|c| vec![c]).unwrap_or_default(), Vec::new(), Job::Static),
-                        Job::Anim => {
+                loop {
+                    if let Ok((path, bytes)) = arx.try_recv() {
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                             let (f, d) = decode_gif_frames(&bytes).unwrap_or_default();
-                            (f, d, Job::Anim)
+                            (path, Job::Anim, f, d)
+                        }));
+                        if let Ok((path, job, frames, delays)) = res {
+                            let _ = tx.send((path, job, frames, delays));
                         }
-                    }));
-                    let (frames, delays, job) = match res {
-                        Ok(x) => x,
-                        Err(_) => (Vec::new(), Vec::new(), job),
-                    };
-                    let _ = tx.send((path, job, frames, delays));
+                    } else if let Ok((path, bytes)) = srx.recv() {
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                            let c = decode_static(&bytes).map(|c| vec![c]).unwrap_or_default();
+                            (path, Job::Static, c, Vec::new())
+                        }));
+                        if let Ok((path, job, frames, delays)) = res {
+                            let _ = tx.send((path, job, frames, delays));
+                        }
+                    } else {
+                        break;
+                    }
                 }
             });
         }
@@ -188,7 +199,8 @@ impl App {
             menu: None,
             toast: None,
             folder_rx: None,
-            job_tx,
+            job_static_tx: static_tx,
+            job_anim_tx: anim_tx,
             done_rx,
             done_tx,
             tex_seq: 0,
@@ -218,12 +230,12 @@ impl App {
         let tail: Vec<PathBuf> = missing.iter().skip(16).cloned().collect();
         for p in tail {
             if let Ok(bytes) = std::fs::read(&p) {
-                let _ = self.job_tx.try_send((p, Job::Static, bytes));
+                let _ = self.job_static_tx.try_send((p, bytes));
             }
         }
         for p in head.into_iter().rev() {
             if let Ok(bytes) = std::fs::read(&p) {
-                let _ = self.job_tx.try_send((p, Job::Static, bytes));
+                let _ = self.job_static_tx.try_send((p, bytes));
             }
         }
         if !missing.is_empty() {
@@ -333,7 +345,7 @@ impl App {
             }
             if let Ok(bytes) = std::fs::read(&fp) {
                 seen.insert(fp.clone());
-                let _ = self.job_tx.try_send((fp, Job::Static, bytes));
+                let _ = self.job_static_tx.try_send((fp, bytes));
             }
         }
         ctx.request_repaint();
@@ -357,13 +369,13 @@ impl App {
                 Avatar { static_tex: placeholder, anim: None },
             );
             if let Ok(bytes) = std::fs::read(path) {
-                let _ = self.job_tx.try_send((path.to_path_buf(), Job::Static, bytes));
+                let _ = self.job_static_tx.try_send((path.to_path_buf(), bytes));
             }
         }
     }
 
     /// hover GIF: 按需预取动画帧 (无动画缓存时)
-    fn ensure_anim(&mut self, path: &std::path::Path) {
+    fn ensure_anim(&mut self, ctx: &egui::Context, path: &std::path::Path) {
         if let Some(av) = self.thumbs.get(path) {
             if av.anim.is_some() || av.static_tex.id() == self.fallback.id() {
                 return;
@@ -372,7 +384,25 @@ impl App {
             return;
         }
         if let Ok(bytes) = std::fs::read(path) {
-            let _ = self.job_tx.try_send((path.to_path_buf(), Job::Anim, bytes));
+            let p = path.to_path_buf();
+            if self.job_anim_tx.try_send((p.clone(), bytes.clone())).is_err() {
+                // 动画队列满: 主线程同步解 (72px GIF, 通常 <50ms) 保证 hover 必动
+                if let Some((colors, delays)) = decode_gif_frames(&bytes) {
+                    if colors.len() > 1 {
+                        let mut frames = Vec::with_capacity(colors.len());
+                        for (i, c) in colors.iter().enumerate() {
+                            self.tex_seq += 1;
+                            frames.push(ctx.load_texture(format!("a{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
+                        }
+                        if let Some(av) = self.thumbs.get_mut(&p) {
+                            av.anim = Some(Animated { frames, delays, current: 0, last_time: 0.0, elapsed_ms: 0 });
+                            self.anim_order.retain(|q| *q != p);
+                            self.anim_order.push_back(p);
+                            self.trim_anim();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -420,7 +450,7 @@ impl App {
         // GIF 实时预览: 悬浮时按播放帧渲染, 否则静态第一帧
         let is_gif = st.is_gif;
         if hover && is_gif {
-            self.ensure_anim(&st.path);
+            self.ensure_anim(ctx, &st.path);
         }
         let tex = self
             .thumbs
@@ -891,14 +921,5 @@ mod tests {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([W, H])
-            .with_resizable(false)
-            .with_title("表情面板"),
-        ..Default::default()
-    };
-    eframe::run_native("表情面板", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
-}
 
+fn main()
