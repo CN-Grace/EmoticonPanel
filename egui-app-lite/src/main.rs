@@ -376,11 +376,8 @@ impl App {
 
     /// hover GIF: 按需预取动画帧 (无动画缓存时)
     fn ensure_anim(&mut self, ctx: &egui::Context, path: &std::path::Path) {
-        if let Some(av) = self.thumbs.get(path) {
-            if av.anim.is_some() || av.static_tex.id() == self.fallback.id() {
-                return;
-            }
-        } else {
+        // 动画已就绪则直接用 (不依赖静态首帧是否完成 — 否则首次 hover 会因 static 未就绪而跳过)
+        if self.thumbs.get(path).map(|av| av.anim.is_some()).unwrap_or(false) {
             return;
         }
         if let Ok(bytes) = std::fs::read(path) {
@@ -399,6 +396,8 @@ impl App {
                             self.anim_order.retain(|q| *q != p);
                             self.anim_order.push_back(p);
                             self.trim_anim();
+                            // 同步建好后必须请求重绘, 否则本帧不刷新 (首次 hover 见不到效果)
+                            ctx.request_repaint();
                         }
                     }
                 }
