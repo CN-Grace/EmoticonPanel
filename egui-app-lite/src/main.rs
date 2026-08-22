@@ -921,12 +921,28 @@ mod tests {
 }
 
 
+fn app_icon() -> Option<std::sync::Arc<egui::IconData>> {
+    // 内嵌图标 PNG -> rgba -> IconData (窗口/任务栏图标)
+    let bytes = include_bytes!("../assets/app.png");
+    let dynimg = image::load_from_memory(bytes).ok()?;
+    let rgba = dynimg.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(std::sync::Arc::new(egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    }))
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([W, H])
             .with_resizable(false)
-            .with_title("表情面板"),
+            .with_title("表情面板")
+            .with_icon(app_icon().unwrap_or_else(|| std::sync::Arc::new(egui::IconData {
+                rgba: vec![0, 0, 0, 0], width: 1, height: 1,
+            }))),
         ..Default::default()
     };
     eframe::run_native("表情面板", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
