@@ -14,3 +14,5 @@ cd egui-app-lite && cargo build --release
 
 > 其他实现见分支: `egui` (功能完备版) / `tauri` (Tauri/WebView2 版)
 > exe 归档: `H:\VibeCoding\EmoticonPanel-archives\` (git 外)
+
+> 提示: 切换分支会清掉被忽略的 `target/` 缓存, 切回后需重新 `cargo build --release`。
