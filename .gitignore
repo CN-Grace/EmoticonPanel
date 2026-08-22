@@ -26,3 +26,4 @@ scripts/wintest/target
 egui-app/target
 
 egui-app-lite/target
+archives/emoticon-panel-*.exe
