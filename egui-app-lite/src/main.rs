@@ -934,6 +934,56 @@ fn app_icon() -> Option<std::sync::Arc<egui::IconData>> {
     }))
 }
 
+
+#[cfg(target_os = "windows")]
+#[test]
+fn clip_no_dib() {
+    use core::win::{set_clipboard, set_hdrop, set_png_formats, set_virtual_file};
+    use windows::Win32::System::DataExchange::{
+        EnumClipboardFormats, GetClipboardFormatNameW, IsClipboardFormatAvailable, RegisterClipboardFormatW,
+    };
+    // 模拟插入: 只写 HDROP + 虚拟文件 + PNG 原始字节 (与 insert_sticker 同集合)
+    let png = include_bytes!("../assets/app.png");
+    let r = unsafe {
+        set_clipboard(|| {
+            set_hdrop(r"H:\组.png")?;
+            set_virtual_file(png, "a.png")?;
+            set_png_formats(png)?;
+            Ok(())
+        })
+    };
+    assert!(r.is_ok(), "write failed: {r:?}");
+    unsafe {
+        use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
+        // EnumClipboardFormats 要求先 OpenClipboard
+        assert!(OpenClipboard(None).is_ok(), "无法打开剪贴板枚举");
+        let mut f = 0u32;
+        let mut buf = [0u16; 64];
+        let mut names = Vec::new();
+        while {
+            f = EnumClipboardFormats(f);
+            f != 0
+        } {
+            let n = GetClipboardFormatNameW(f, &mut buf) as usize;
+            let name = if n > 0 { String::from_utf16_lossy(&buf[..n]) } else { String::new() };
+            names.push(format!("{f}:{name}"));
+            assert!(f != 8, "CF_DIB 不应出现 (白底元凶): {names:?}");
+            assert!(f != 1, "CF_TEXT 意外出现: {names:?}");
+        }
+        let _ = CloseClipboard();
+        assert!(
+            IsClipboardFormatAvailable(15).is_ok(),
+            "CF_HDROP 缺失: {names:?}"
+        );
+        let png_fmt = RegisterClipboardFormatW(windows::core::w!("PNG"));
+        assert!(
+            IsClipboardFormatAvailable(png_fmt).is_ok(),
+            "PNG 注册格式缺失: {names:?}"
+        );
+        eprintln!("[clip] formats = {names:?} (无 CF_DIB/8, 有 HDROP/15 + PNG)");
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
