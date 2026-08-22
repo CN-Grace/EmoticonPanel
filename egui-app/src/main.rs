@@ -60,17 +60,22 @@ fn decode_frames(bytes: &[u8], ctx: &egui::Context, max: u32, tag: &str) -> Opti
     if fmt == image::ImageFormat::Gif {
         use image::AnimationDecoder;
         let decoder = image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).ok()?;
-        let decoded = decoder.into_frames().collect_frames().ok()?;
-        for (i, frame) in decoded.into_iter().enumerate() {
-            if i >= 48 {
-                break;
+        let mut it = decoder.into_frames();
+        while frames.len() < 48 {
+            match it.next() {
+                Some(Ok(frame)) => {
+                    let (n, d) = frame.delay().numer_denom_ms();
+                    delays.push(if d == 0 { 100 } else { ((n as f64 / d as f64) * 1000.0).max(20.0) as u64 });
+                    let buf = frame.into_buffer();
+                    let (nw, nh) = fit_dim(buf.width(), buf.height(), max);
+                    let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
+                    frames.push(egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw()));
+                }
+                _ => break,
             }
-            let (n, d) = frame.delay().numer_denom_ms();
-            delays.push(if d == 0 { 100 } else { ((n as f64 / d as f64) * 1000.0).max(20.0) as u64 });
-            let buf = frame.into_buffer();
-            let (nw, nh) = fit_dim(buf.width(), buf.height(), max);
-            let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
-            frames.push(egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw()));
+        }
+        if frames.is_empty() {
+            return None;
         }
     } else {
         let buf = image::load_from_memory(bytes).ok()?.to_rgba8();
@@ -104,24 +109,20 @@ struct App {
     stickers: Vec<Sticker>,
     current: usize,
     thumbs: HashMap<PathBuf, Avatar>,
-    previews: HashMap<PathBuf, TextureHandle>,
     tab_cover: Vec<Option<TextureHandle>>,
     fallback: TextureHandle,
     show_settings: bool,
     menu: Option<(Pos2, usize)>, // 右键菜单位置 + 分组索引
-    hover_pv: Option<(Pos2, TextureId)>,
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
-    // 后台解码
-    pending: std::collections::VecDeque<(PathBuf, Vec<u8>)>,
-    inflight: usize,
+    // 后台解码: 固定 worker 池 (MPMC)
+    job_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
     done_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<TextureHandle>, Vec<u64>)>,
     done_tx: std::sync::mpsc::Sender<(PathBuf, Vec<TextureHandle>, Vec<u64>)>,
     tabs_off: f32,
     tab_hover_last: Option<usize>,
     first_paths: Vec<PathBuf>,
     thumb_order: std::collections::VecDeque<PathBuf>,
-    preview_order: std::collections::VecDeque<PathBuf>,
 }
 
 impl App {
@@ -134,6 +135,25 @@ impl App {
         let root = core::root_dir();
         let packages = core::list_packages(&root);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<(PathBuf, Vec<u8>)>();
+        // 固定 worker 池: catch_unwind 防崩溃导致队列停摆
+        for _ in 0..MAX_INFLIGHT {
+            let rx = job_rx.clone();
+            let ctx = cc.egui_ctx.clone();
+            let tx = done_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok((path, bytes)) = rx.recv() {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        decode_frames(&bytes, &ctx, THUMB_MAX, &path.to_string_lossy())
+                    }));
+                    let (frames, delays) = match res {
+                        Ok(Some((f, d))) => (f, d),
+                        _ => (Vec::new(), Vec::new()),
+                    };
+                    let _ = tx.send((path, frames, delays));
+                }
+            });
+        }
         let mut a = Self {
             attach: Attach::default(),
             root,
@@ -141,23 +161,19 @@ impl App {
             stickers: Vec::new(),
             current: 0,
             thumbs: HashMap::new(),
-            previews: HashMap::new(),
             tab_cover: Vec::new(),
             fallback,
             show_settings: false,
             menu: None,
-            hover_pv: None,
             toast: None,
             folder_rx: None,
-            pending: std::collections::VecDeque::new(),
-            inflight: 0,
+            job_tx,
             done_rx,
             done_tx,
             tabs_off: 0.0,
             tab_hover_last: None,
             first_paths: Vec::new(),
             thumb_order: std::collections::VecDeque::new(),
-            preview_order: std::collections::VecDeque::new(),
         };
         a.load_group(&cc.egui_ctx);
         a
@@ -169,54 +185,35 @@ impl App {
             .get(self.current)
             .and_then(|p| core::list_stickers(&self.root, &p.name).ok())
             .unwrap_or_default();
-        // 保留跨组缓存, 只对缺失贴图补解码任务; 当前组插队优先
-        let mut seen: std::collections::HashSet<PathBuf> = self.thumbs.keys().cloned().collect();
-        for (p, _) in self.pending.iter() {
-            seen.insert(p.clone());
-        }
+        // 保留跨组缓存, 只对缺失贴图发起解码; 可视区优先
         let mut missing: Vec<PathBuf> = Vec::new();
         for st in &self.stickers {
-            if !seen.contains(&st.path) {
+            if !self.thumbs.contains_key(&st.path) {
                 missing.push(st.path.clone());
             }
         }
-        // 可视区(前16个)插队优先, 其余殿后
         let head: Vec<PathBuf> = missing.iter().take(16).cloned().collect();
         let tail: Vec<PathBuf> = missing.iter().skip(16).cloned().collect();
         for p in tail {
             if let Ok(bytes) = std::fs::read(&p) {
-                self.pending.push_back((p, bytes));
+                let _ = self.job_tx.send((p, bytes));
             }
         }
         for p in head.into_iter().rev() {
             if let Ok(bytes) = std::fs::read(&p) {
-                self.pending.push_front((p, bytes));
+                let _ = self.job_tx.send((p, bytes));
             }
         }
-        let _ = ctx;
+        if !missing.is_empty() {
+            ctx.request_repaint();
+        }
         self.rebuild_tab_covers(ctx);
     }
 
-    /// 每帧: 启动 ≤MAX_INFLIGHT 个解码线程 + 收完成结果
-    fn pump_decode(&mut self, ctx: &egui::Context) {
-        while self.inflight < MAX_INFLIGHT {
-            let Some((path, bytes)) = self.pending.pop_front() else { break };
-            let tx = self.done_tx.clone();
-            let ctx = ctx.clone();
-            let tag = path.to_string_lossy().to_string();
-            self.inflight += 1;
-            std::thread::spawn(move || {
-                let r = decode_frames(&bytes, &ctx, THUMB_MAX, &tag);
-                let (frames, delays) = match r {
-                    Some((f, d)) => (f, d),
-                    None => (Vec::new(), Vec::new()),
-                };
-                let _ = tx.send((path, frames, delays));
-            });
-        }
+    /// 每帧: 收 worker 完成结果
+    fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
         while let Ok((path, frames, delays)) = self.done_rx.try_recv() {
-            self.inflight -= 1;
             got += 1;
             if !frames.is_empty() {
                 if let Some(i) = self.first_paths.iter().position(|f| *f == path) {
@@ -246,7 +243,7 @@ impl App {
                 break;
             }
         }
-        if got > 0 || !self.pending.is_empty() {
+        if got > 0 {
             ctx.request_repaint();
         }
     }
@@ -271,16 +268,13 @@ impl App {
         }
         // 为所有包的首张贴图补充解码任务 (未选中组的封面也需要)
         let mut seen: std::collections::HashSet<PathBuf> = self.thumbs.keys().cloned().collect();
-        for (p, _) in self.pending.iter() {
-            seen.insert(p.clone());
-        }
         for fp in self.first_paths.clone() {
             if fp.as_os_str().is_empty() || seen.contains(&fp) {
                 continue;
             }
             if let Ok(bytes) = std::fs::read(&fp) {
                 seen.insert(fp.clone());
-                self.pending.push_back((fp, bytes));
+                let _ = self.job_tx.send((fp, bytes));
             }
         }
         ctx.request_repaint();
@@ -301,29 +295,6 @@ impl App {
                 let tag = path.to_string_lossy().to_string();
                 if let Some((frames, delays)) = decode_frames(&bytes, ctx, THUMB_MAX, &tag) {
                     self.thumbs.insert(path.to_path_buf(), Avatar { frames, delays, current: 0, last_time: 0.0 });
-                }
-            }
-        }
-    }
-
-    fn ensure_preview(&mut self, ctx: &egui::Context, st: &Sticker) {
-        if !self.previews.contains_key(&st.path) {
-            if let Ok(bytes) = std::fs::read(&st.path) {
-                if let Ok(img) = image::load_from_memory(&bytes) {
-                    let buf = img.to_rgba8();
-                    let (nw, nh) = fit_dim(buf.width(), buf.height(), PREVIEW_MAX);
-                    let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
-                    let color = egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw());
-                    let h = ctx.load_texture(format!("pv_{}", st.path.to_string_lossy()), color, TextureOptions::LINEAR);
-                    self.previews.insert(st.path.clone(), h);
-                    self.preview_order.push_back(st.path.clone());
-                    while self.previews.len() > 250 {
-                        if let Some(old) = self.preview_order.pop_front() {
-                            self.previews.remove(&old);
-                        } else {
-                            break;
-                        }
-                    }
                 }
             }
         }
@@ -386,10 +357,6 @@ impl App {
             FontId::proportional(9.5),
             C_DIM,
         );
-        // hover 大预览
-        if resp.hovered() {
-            self.hover_pv = Some((resp.hover_pos().unwrap_or(rect.left_top()), tex));
-        }
         resp.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
@@ -430,7 +397,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.pump_decode(ctx);
+        self.poll_done(ctx);
         self.advance_animations(ctx);
         if self.attach.picking.load(std::sync::atomic::Ordering::SeqCst) {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -722,30 +689,6 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                     });
             });
-
-        // ---------- hover 大预览 ----------
-        if let Some((pos, tid)) = self.hover_pv.clone() {
-            let size = vec2(150.0, 150.0);
-            let mut r = Rect::from_min_size(pos + vec2(16.0, 10.0), size);
-            let max_rect = ctx.screen_rect();
-            if r.right() > max_rect.right() {
-                r = r.translate(vec2(-(r.width() + 32.0), 0.0));
-            }
-            egui::Area::new(Id::new("hpv"))
-                .fixed_pos(r.min)
-                .order(egui::Order::Foreground)
-                .show(ctx, |ui| {
-                    Frame::none()
-                        .fill(C_WHITE)
-                        .rounding(8.0)
-                        .inner_margin(Margin::same(6.0))
-                        .shadow(egui::epaint::Shadow { offset: vec2(0.0, 3.0), blur: 16.0, spread: 0.0, color: Color32::from_black_alpha(50) })
-                        .show(ui, |ui| {
-                            ui.add(egui::Image::new(egui::load::SizedTexture::new(tid, size)).fit_to_exact_size(size));
-                        });
-                });
-            self.hover_pv = None;
-        }
 
         // ---------- toast ----------
         if let Some((msg, t0)) = &self.toast {
