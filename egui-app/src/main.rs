@@ -20,8 +20,8 @@ const CELL_W: f32 = 75.0;
 const CELL_H: f32 = 97.0;
 const IMG: f32 = 72.0;
 const COLS: usize = 4;
-const W: f32 = 320.0;
-const H: f32 = 480.0;
+const W: f32 = 318.0;
+const H: f32 = 465.0;
 const BOTTOM_H: f32 = 46.0;
 const MAX_INFLIGHT: usize = 6;
 
@@ -235,6 +235,20 @@ impl App {
                 .filter(|h| h.id() != self.fallback.id())
                 .cloned();
             self.tab_cover.push(keep.or_else(|| Some(self.fallback.clone())));
+        }
+        // 为所有包的首张贴图补充解码任务 (未选中组的封面也需要)
+        let mut seen: std::collections::HashSet<PathBuf> = self.thumbs.keys().cloned().collect();
+        for (p, _) in self.pending.iter() {
+            seen.insert(p.clone());
+        }
+        for fp in self.first_paths.clone() {
+            if fp.as_os_str().is_empty() || seen.contains(&fp) {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&fp) {
+                seen.insert(fp.clone());
+                self.pending.push_back((fp, bytes));
+            }
         }
         ctx.request_repaint();
     }
@@ -526,7 +540,7 @@ impl eframe::App for App {
             }
         }
 
-        // ---------- 设置面板 (自绘浮层, 行区块背景, 宽<=300) ----------
+        // ---------- 设置面板 (名称左加粗/按钮右/值第二行, 宽<=300) ----------
         if self.show_settings {
             egui::Area::new(Id::new("settings"))
                 .anchor(Align2::RIGHT_BOTTOM, vec2(-8.0, -(BOTTOM_H + 8.0)))
@@ -540,70 +554,78 @@ impl eframe::App for App {
                         .shadow(egui::epaint::Shadow { offset: vec2(0.0, 4.0), blur: 18.0, spread: 0.0, color: Color32::from_black_alpha(46) })
                         .show(ui, |ui| {
                             ui.set_width(284.0); // 总宽 284+16 = 300
-                            let label_w = 72.0;
-                            let btn_w = 62.0;
-
-                            // 每行灰底区块
                             let row_frame = Frame::none()
                                 .fill(Color32::from_rgb(245, 245, 245))
                                 .rounding(8.0)
                                 .inner_margin(Margin::symmetric(10.0, 7.0));
-                            let v_text = |x: &str| -> egui::RichText { egui::RichText::new(x).size(12.0) };
+                            let name = |x: &str| RichText::new(x).size(13.0).strong().color(C_TEXT);
+                            let v_text = |x: &str| RichText::new(x).size(12.0).color(C_TEXT);
 
-                            // 目标窗口
+                            // 目标窗口: 第一行 名+右按钮; 第二行 状态
+                            let t = self.attach.target.lock().unwrap().clone();
+                            let picking = self.attach.picking.load(std::sync::atomic::Ordering::SeqCst);
                             row_frame.clone().show(ui, |ui| {
+                                let mut act = None;
                                 ui.horizontal(|ui| {
-                                    ui.add_sized([label_w, 22.0], egui::Label::new(RichText::new("目标窗口").size(13.0)).truncate());
-                                    let t = self.attach.target.lock().unwrap().clone();
-                                    let picking = self.attach.picking.load(std::sync::atomic::Ordering::SeqCst);
-                                    let status = if picking {
-                                        "正在选择…点击目标窗口".to_string()
-                                    } else if let Some(t) = &t {
-                                        format!("{} · {}", t.process, trunc(&t.title, 7))
-                                    } else {
-                                        "未选择".to_string()
-                                    };
-                                    ui.add_sized([110.0, 22.0], egui::Label::new(v_text(&status)).truncate());
-                                    if picking {
-                                        if chip(ui, vec2(btn_w, 28.0), "取消", false).clicked() {
-                                            core::cancel_pick(&self.attach);
+                                    ui.label(name("目标窗口"));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if picking {
+                                            if chip(ui, vec2(56.0, 28.0), "取消", false).clicked() {
+                                                act = Some(0);
+                                            }
+                                        } else if chip(ui, vec2(56.0, 28.0), if t.is_some() { "重选" } else { "选择" }, true).clicked() {
+                                            act = Some(1);
                                         }
-                                    } else if chip(ui, vec2(btn_w, 28.0), if t.is_some() { "重选" } else { "选择" }, true).clicked() {
-                                        core::begin_pick(&self.attach);
-                                        self.toast = Some(("请在 15 秒内点击目标窗口".into(), std::time::Instant::now()));
-                                    }
+                                    });
                                 });
+                                let status = if picking {
+                                    "正在选择…目前请点击目标窗口".to_string()
+                                } else if let Some(t) = &t {
+                                    format!("{} · {}", t.process, trunc(&t.title, 8))
+                                } else {
+                                    "未选择".to_string()
+                                };
+                                ui.label(v_text(&status).color(if picking { C_ORANGE } else { C_DIM }));
+                                if act == Some(0) {
+                                    core::cancel_pick(&self.attach);
+                                } else if act == Some(1) {
+                                    core::begin_pick(&self.attach);
+                                    self.toast = Some(("请在 15 秒内点击目标窗口".into(), std::time::Instant::now()));
+                                }
                             });
                             ui.add_space(8.0);
 
-                            // 刷新
+                            // 刷新: 名+右按钮 (无第二行)
                             row_frame.clone().show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.add_sized([label_w, 22.0], egui::Label::new(RichText::new("刷新表情包").size(13.0)).truncate());
-                                    ui.add_sized([110.0, 22.0], egui::Label::new(v_text("重新扫描分组")));
-                                    if chip(ui, vec2(btn_w, 28.0), "刷新", false).clicked() {
-                                        self.refresh(ctx);
-                                        self.toast = Some(("已刷新表情包".into(), std::time::Instant::now()));
-                                    }
+                                    ui.label(name("刷新表情包"));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if chip(ui, vec2(56.0, 28.0), "刷新", false).clicked() {
+                                            self.refresh(ctx);
+                                            self.toast = Some(("已刷新表情包".into(), std::time::Instant::now()));
+                                        }
+                                    });
                                 });
                             });
                             ui.add_space(8.0);
 
-                            // 表情包位置 (值可换行显示完整路径)
+                            // 表情包位置: 第一行 名+右按钮; 第二行 完整路径(换行)
                             row_frame.show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    ui.add_sized([label_w, 22.0], egui::Label::new(RichText::new("表情包位置").size(13.0)).truncate());
-                                    if chip(ui, vec2(btn_w, 28.0), "选文件夹", false).clicked() {
-                                        let (tx, rx) = mpsc::channel();
-                                        self.folder_rx = Some(rx);
-                                        std::thread::spawn(move || {
-                                            let dir = rfd::FileDialog::new().set_title("选择表情包文件夹").pick_folder();
-                                            let _ = tx.send(dir);
-                                        });
-                                    }
+                                    ui.label(name("表情包位置"));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if chip(ui, vec2(68.0, 28.0), "选文件夹", false).clicked() {
+                                            let (tx, rx) = mpsc::channel();
+                                            self.folder_rx = Some(rx);
+                                            std::thread::spawn(move || {
+                                                let dir = rfd::FileDialog::new().set_title("选择表情包文件夹").pick_folder();
+                                                let _ = tx.send(dir);
+                                            });
+                                        }
+                                    });
                                 });
                                 let path_text = self.root.to_string_lossy().to_string();
-                                ui.add(egui::Label::new(v_text(&path_text)).wrap());
+                                ui.add(egui::Label::new(v_text(&path_text).color(C_DIM)).wrap());
                             });
                             ui.add_space(4.0);
                         });
@@ -771,7 +793,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([W, H])
-            .with_min_inner_size([300.0, 460.0])
+            .with_min_inner_size([300.0, 445.0])
             .with_title("表情面板"),
         ..Default::default()
     };
