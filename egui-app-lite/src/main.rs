@@ -1,6 +1,5 @@
 // 表情面板 — 纯 Rust egui 版 (1:1 复刻 Tauri 版微信风格视觉)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod core;
 
 use core::{Attach, Sticker};
@@ -850,20 +849,11 @@ fn chip(ui: &mut egui::Ui, size: Vec2, text: &str, filled: bool) -> egui::Respon
 fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
     let mut fonts = FontDefinitions::default();
-    for c in [
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\Deng.ttf",
-        r"C:\Windows\Fonts\Dengb.ttf",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ] {
-        if let Ok(bytes) = std::fs::read(c) {
-            fonts.font_data.insert("cjk".into(), FontData::from_owned(bytes));
-            for f in [FontFamily::Proportional, FontFamily::Monospace] {
-                fonts.families.entry(f).or_default().insert(0, "cjk".into());
-            }
-            break;
-        }
+    // 内嵌 GB2312 子集字体 (2MB, 覆盖 6692 汉字 + ASCII + 中文标点)
+    let subset: &[u8] = include_bytes!("../assets/cjk-subset.ttf");
+    fonts.font_data.insert("cjk".into(), FontData::from_owned(subset.to_vec()));
+    for f in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.entry(f).or_default().insert(0, "cjk".into());
     }
     ctx.set_fonts(fonts);
 }
