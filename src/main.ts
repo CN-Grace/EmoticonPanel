@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 interface StickerInfo {
   url: string;
@@ -35,19 +36,15 @@ const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
 const gridArea = $("#gridArea");
-const groupNameEl = $("#groupName");
 const tabsEl = $("#tabs");
 const preview = $("#preview");
 const previewImg = document.querySelector("#previewImg") as HTMLImageElement;
 const ctxMenu = $("#ctxMenu");
-const shopView = $("#shopView");
-const shopList = $("#shopList");
-const shopHint = $("#shopHint");
 const modalMask = $("#modalMask");
 const modalText = $("#modalText");
 const toast = $("#toast");
-const attachBtn = $("#attachBtn");
-const attachLabel = $("#attachLabel");
+const settings = $("#settings");
+const setLocationVal = $("#setLocationVal");
 
 // ---------- 基础工具 ----------
 let toastTimer: number | undefined;
@@ -100,6 +97,7 @@ async function loadAll() {
   ]);
   state.packages = pkgs;
   state.root = root;
+  setLocationVal.textContent = ellipsis(root, 30);
   renderTabs();
   if (state.current >= pkgs.length) state.current = 0;
   if (pkgs.length) {
@@ -107,7 +105,6 @@ async function loadAll() {
   } else {
     state.stickers = [];
     renderGrid();
-    groupNameEl.textContent = "还没有表情包";
   }
   refreshTarget();
 }
@@ -139,6 +136,18 @@ function renderTabs() {
   });
 }
 
+// Tab 栏滚轮 → 横向滚动切换表情包组
+tabsEl.addEventListener(
+  "wheel",
+  (e) => {
+    if (e.deltaY !== 0) {
+      e.preventDefault();
+      tabsEl.scrollLeft += e.deltaY;
+    }
+  },
+  { passive: false }
+);
+
 async function selectGroup(i: number) {
   state.current = i;
   const p = state.packages[i];
@@ -149,7 +158,6 @@ async function selectGroup(i: number) {
   tabsEl.querySelectorAll(".tab").forEach((t, idx) =>
     t.classList.toggle("active", idx === i)
   );
-  groupNameEl.textContent = `${p.name} · ${p.count} 个${p.gifCount ? ` (${p.gifCount} 个动图)` : ""}`;
   gridArea.scrollTop = 0;
   renderGrid();
 }
@@ -160,13 +168,17 @@ function renderGrid() {
     const cell = document.createElement("div");
     cell.className = "stk-cell";
     cell.dataset.path = st.url;
-    cell.dataset.name = `${state.packages[state.current]?.name}/${st.name}`;
     const img = document.createElement("img");
     img.alt = st.name;
     loadImage(st.url)
       .then((d) => (img.src = d))
       .catch(() => {});
+    const label = document.createElement("div");
+    label.className = "stk-name";
+    label.textContent = st.name; // 图片文件名
+    label.title = st.name;
     cell.appendChild(img);
+    cell.appendChild(label);
     cell.addEventListener("click", () => insertSticker(st));
     cell.addEventListener("pointerenter", (e) =>
       showPreview(e.clientX, e.clientY, st.url)
@@ -203,7 +215,7 @@ function hidePreview() {
   previewImg.removeAttribute("src");
 }
 
-// ---------- attach 目标窗口 + 插入 ----------
+// ---------- attach 目标窗口 (设置面板) ----------
 async function refreshTarget() {
   try {
     const [target, picking] = await Promise.all([
@@ -212,52 +224,54 @@ async function refreshTarget() {
     ]);
     state.target = target;
     state.picking = picking;
-    renderAttach();
+    renderTargetVal();
   } catch {
     /* ignore */
   }
 }
 
-function renderAttach() {
-  attachBtn.classList.toggle("linked", !!state.target && !state.picking);
-  attachBtn.classList.toggle("picking", state.picking);
+function renderTargetVal() {
+  const v = "#setTargetVal";
+  const btn = "#setTargetBtn";
   if (state.picking) {
-    attachLabel.textContent = "点击目标窗口… 取消";
-    attachBtn.title = "正在拾取 (再次点击取消)";
+    $(v).textContent = "正在选择… 点击目标窗口";
+    $(btn).textContent = "取消";
+    $(btn).classList.add("warn");
+    $(btn).classList.remove("primary");
   } else if (state.target) {
-    const t = state.target;
-    attachLabel.textContent = `${t.process} · ${ellipsis(t.title, 10)}`;
-    attachBtn.title = `目标: ${t.title} — 点击重新选择`;
+    $(v).textContent = `${state.target.process} · ${ellipsis(state.target.title, 14)}`;
+    $(btn).textContent = "重选";
+    $(btn).classList.remove("warn");
+    $(btn).classList.add("primary");
   } else {
-    attachLabel.textContent = "选择窗口";
-    attachBtn.title = "点击选择要插入表情的目标窗口";
+    $(v).textContent = "未选择";
+    $(btn).textContent = "选择";
+    $(btn).classList.remove("warn", "primary");
   }
 }
 
-attachBtn.addEventListener("click", async () => {
+$("#setTargetBtn").addEventListener("click", async () => {
   if (state.picking) {
     await invoke("cancel_pick");
     state.picking = false;
-    renderAttach();
+    renderTargetVal();
     return;
   }
   try {
     await invoke("begin_pick");
     state.picking = true;
-    renderAttach();
+    renderTargetVal();
     showToast("请在 15 秒内点击目标窗口");
-    // 轮询拾取结果
     const t0 = Date.now();
     const timer = window.setInterval(async () => {
       const picking = await invoke<boolean>("is_picking");
-      state.picking = picking;
       const target = await invoke<TargetInfo | null>("get_target");
+      state.picking = picking;
       state.target = target;
-      renderAttach();
+      renderTargetVal();
       if (!picking || Date.now() - t0 > 16000) {
         window.clearInterval(timer);
         if (target) showToast(`已绑定: ${target.process} · ${target.title}`);
-        else if (!picking) showToast("未选择目标窗口");
       }
     }, 400);
   } catch (err) {
@@ -265,13 +279,54 @@ attachBtn.addEventListener("click", async () => {
   }
 });
 
+// ---------- 设置面板 ----------
+$("#gearBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  settings.hidden = !settings.hidden;
+  if (!settings.hidden) {
+    refreshTarget();
+    setLocationVal.textContent = ellipsis(state.root || "-", 30);
+  }
+});
+
+window.addEventListener("click", (e) => {
+  ctxMenu.hidden = true;
+  if (!settings.hidden && !settings.contains(e.target as Node)) {
+    settings.hidden = true;
+  }
+});
+
+$("#setRefreshBtn").addEventListener("click", () => {
+  loadAll().then(() => showToast("已刷新表情包"));
+});
+
+// 表情包位置: 选择文件夹并持久化
+$("#setLocationBtn").addEventListener("click", async () => {
+  try {
+    const dir = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "选择表情包文件夹",
+    });
+    if (typeof dir === "string" && dir) {
+      const root = await invoke<string>("set_stickers_dir", { path: dir });
+      state.root = root;
+      showToast("表情包位置已切换");
+      await loadAll();
+    }
+  } catch (err) {
+    showToast(String(err));
+  }
+});
+
+// ---------- 插入表情 ----------
 async function insertSticker(st: StickerInfo) {
   if (state.picking) {
     showToast("先完成目标窗口选择");
     return;
   }
   if (!state.target) {
-    showToast("请先点击右下角「选择窗口」绑定目标");
+    showToast("请先在 ⚙ 设置里选择目标窗口");
     return;
   }
   try {
@@ -281,11 +336,6 @@ async function insertSticker(st: StickerInfo) {
     showToast(String(err));
   }
 }
-
-// ---------- 刷新 ----------
-$("#refreshBtn").addEventListener("click", () => {
-  loadAll().then(() => showToast("已刷新表情包"));
-});
 
 // ---------- 右键删除分组 ----------
 function showCtxMenu(x: number, y: number, idx: number) {
@@ -313,84 +363,6 @@ function showCtxMenu(x: number, y: number, idx: number) {
   ctxMenu.style.top = Math.min(y, window.innerHeight - r.height - 4) + "px";
   ctxMenu.hidden = false;
 }
-
-window.addEventListener("click", () => (ctxMenu.hidden = true));
-
-// ---------- 商店 ----------
-$("#shopBtn").addEventListener("click", () => openShop());
-
-async function openShop() {
-  const installed = new Set(state.packages.map((p) => p.name));
-  const [pkgs, root] = await Promise.all([
-    invoke<PackageInfo[]>("shop_list"),
-    invoke<string>("get_root"),
-  ]);
-  shopHint.innerHTML =
-    `点「下载」把商店表情包装进分组; 自定义表情包:把文件夹放入\n<code>${ellipsis(root, 34)}</code>\n然后点面板上的 ⭮ 刷新即可(支持 gif / png)` +
-    `<div class="open-root"><button id="openRoot">打开文件夹</button></div>`;
-  shopView.hidden = false;
-
-  $("#openRoot")?.addEventListener("click", async () => {
-    try {
-      await invoke("reveal_root");
-    } catch {
-      showToast("无法打开文件夹");
-    }
-  });
-
-  shopList.innerHTML = "";
-  if (!pkgs.length) {
-    const empty = document.createElement("div");
-    empty.className = "shop-empty";
-    empty.textContent = "商店里暂时没有表情包";
-    shopList.appendChild(empty);
-    return;
-  }
-  for (const p of pkgs) {
-    const row = document.createElement("div");
-    row.className = "shop-item";
-
-    const cover = document.createElement("img");
-    cover.className = "cover";
-    if (p.cover) {
-      loadImage(p.cover).then((d) => (cover.src = d)).catch(() => {});
-    }
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    const name = document.createElement("div");
-    name.className = "pname";
-    name.textContent = p.name;
-    const desc = document.createElement("div");
-    desc.className = "pdesc";
-    desc.textContent = `${p.count} 个表情${p.gifCount ? ` · ${p.gifCount} 个动图` : ""} · 点击下载后出现在底部分组`;
-    meta.append(name, desc);
-
-    const btn = document.createElement("button");
-    const isInstalled = installed.has(p.name);
-    btn.className = "dl-btn" + (isInstalled ? " done" : "");
-    btn.textContent = isInstalled ? "已下载" : "下载";
-    btn.disabled = isInstalled;
-    if (!isInstalled) {
-      btn.addEventListener("click", async () => {
-        try {
-          await invoke("install_package", { name: p.name });
-          showToast(`已下载「${p.name}」`);
-          await loadAll();
-          openShop();
-        } catch (err) {
-          showToast(String(err));
-        }
-      });
-    }
-
-    row.append(cover, meta, btn);
-    shopList.appendChild(row);
-  }
-}
-
-$("#shopBack").addEventListener("click", () => {
-  shopView.hidden = true;
-});
 
 // ---------- 启动 ----------
 window.addEventListener("DOMContentLoaded", () => {

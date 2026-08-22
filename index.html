@@ -10,22 +10,32 @@
 
   <body>
     <div id="app">
-      <!-- 表情网格 (上下滚动) + 表情包名 -->
-      <div class="grid-wrap">
-        <div class="grid-area" id="gridArea"></div>
-        <div class="group-name" id="groupName"></div>
-      </div>
+      <!-- 表情网格 (上下滚动), 每个表情下方显示图片名 -->
+      <div class="grid-area" id="gridArea"></div>
 
-      <!-- 底部栏: 分组 Tab + 商店 + 刷新 + attach 目标窗口 -->
+      <!-- 底部栏: 表情包组 Tab (滚轮切换) + 设置 -->
       <div class="bottom-bar">
         <div class="tabs" id="tabs"></div>
-        <button class="icon-btn shop-entry" id="shopBtn" title="表情商店">＋</button>
-        <button class="icon-btn" id="refreshBtn" title="刷新表情包">⭮</button>
-        <span class="tabs-spacer"></span>
-        <button class="attach-btn" id="attachBtn" title="点击选择要插入表情的目标窗口">
-          <span class="attach-ico">📌</span>
-          <span class="attach-label" id="attachLabel">选择窗口</span>
-        </button>
+        <button class="icon-btn gear" id="gearBtn" title="设置">⚙</button>
+      </div>
+
+      <!-- 设置面板 -->
+      <div class="settings" id="settings" hidden>
+        <div class="set-row" id="setTarget">
+          <div class="set-label">目标窗口</div>
+          <div class="set-value" id="setTargetVal">未选择</div>
+          <button class="set-btn" id="setTargetBtn">选择</button>
+        </div>
+        <div class="set-row" id="setRefresh">
+          <div class="set-label">刷新表情包</div>
+          <div class="set-value dim">重新扫描分组</div>
+          <button class="set-btn" id="setRefreshBtn">刷新</button>
+        </div>
+        <div class="set-row" id="setLocation">
+          <div class="set-label">表情包位置</div>
+          <div class="set-value dim" id="setLocationVal">-</div>
+          <button class="set-btn" id="setLocationBtn">选择文件夹</button>
+        </div>
       </div>
 
       <!-- 悬浮大预览 -->
@@ -33,17 +43,6 @@
 
       <!-- 右键菜单 -->
       <div class="ctx-menu" id="ctxMenu" hidden></div>
-
-      <!-- 商店浮层 -->
-      <div class="shop-view" id="shopView" hidden>
-        <div class="shop-head">
-          <button class="icon-btn" id="shopBack">← 返回</button>
-          <span class="shop-title">表情商店</span>
-          <span></span>
-        </div>
-        <div class="shop-hint" id="shopHint"></div>
-        <div class="shop-list" id="shopList"></div>
-      </div>
 
       <!-- 确认弹窗 -->
       <div class="modal-mask" id="modalMask" hidden>

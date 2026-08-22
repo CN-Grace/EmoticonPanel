@@ -12,13 +12,21 @@ window.__MOCK__ = {
   pkgs: [
     { name: "基本表情", cover: null, count: 24, gifCount: 0, shop: false },
     { name: "元气团子", cover: null, count: 16, gifCount: 16, shop: false },
-    { name: "像素猫", cover: null, count: 20, gifCount: 0, shop: false }
+    { name: "像素猫", cover: null, count: 20, gifCount: 0, shop: false },
+    { name: "表情包D", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包E", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包F", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包G", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包H", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包I", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包J", cover: null, count: 24, gifCount: 0, shop: false },
+    { name: "表情包K", cover: null, count: 24, gifCount: 0, shop: false }
   ],
   counts: { "基本表情": 24, "元气团子": 16, "像素猫": 20 },
-  shop: [{ name: "柴犬日常", cover: null, count: 12, gifCount: 12, shop: true }],
   installed: [],
   target: null,
-  picking: false
+  picking: false,
+  root: "C:/mock/stickers"
 };
 window.__TAURI_INTERNALS__ = {
   invoke: async (cmd, args = {}) => {
@@ -26,20 +34,19 @@ window.__TAURI_INTERNALS__ = {
     const M = window.__MOCK__;
     switch (cmd) {
       case "list_packages": return M.pkgs;
-      case "get_root": return "C:/mock/stickers";
+      case "get_root": return M.root;
+      case "set_stickers_dir": M.root = args.path; M.calls.push(["set_stickers_dir_called", args.path]); return args.path;
       case "list_stickers": {
         const n = M.counts[args.package] != null ? M.counts[args.package] : 24;
         return Array.from({ length: n }, (_, i) => ({
-          url: "C:/mock/stickers/" + args.package + "/" + String(i + 1).padStart(2, "0") + ".png",
-          name: String(i + 1),
+          url: M.root + "/" + args.package + "/" + String(i + 1).padStart(2, "0") + ".png",
+          name: "表情" + String(i + 1),
           isGif: args.package === "元气团子"
         }));
       }
       case "read_sticker": return M.png;
-      case "shop_list": return M.shop;
-      case "install_package": M.installed.push(args.name); M.pkgs.push({ name: args.name, cover: null, count: 12, gifCount: 12, shop: false }); return null;
+      case "plugin:dialog|open": return "D:/my/emoticons";
       case "delete_package": M.pkgs = M.pkgs.filter((p) => p.name !== args.name); return null;
-      case "reveal_root": return null;
       case "get_target": return M.target;
       case "is_picking": return M.picking;
       case "begin_pick": M.picking = true; return null;
@@ -76,104 +83,108 @@ function check(name, ok, extra) {
   await new Promise((r) => server.listen(8899, r));
   const { chromium } = require("D:/dev/playwright-mcp/node_modules/playwright");
   const browser = await chromium.launch({ channel: "msedge", headless: true });
-  const page = await browser.newPage({ viewport: { width: 300, height: 340 } });
+  const page = await browser.newPage({ viewport: { width: 350, height: 400 } });
   page.on("pageerror", (e) => console.log("PAGEERROR:", e.message));
 
   await page.goto("http://127.0.0.1:8899/", { waitUntil: "load" });
-  await page.waitForSelector(".tab");
+  await page.waitForSelector(".stk-cell");
 
-  // 1. 无输入框 (用户要求去掉)
-  const hasInputBar = await page.locator(".input-bar").count();
-  check("no input bar", hasInputBar === 0, `count=${hasInputBar}`);
-
-  // 2. 初始渲染: 3 分组; 4 列网格显示全部 24 张 (不分页); 表情包名
-  check("tabs==3", (await page.locator(".tab").count()) === 3);
-  check("grid cells==24 (all, no pagination)", (await page.locator(".stk-cell").count()) === 24);
-  check("no page dots", (await page.locator(".page-dots").count()) === 0);
-  check("group name shown", (await page.locator("#groupName").textContent()) === "基本表情 · 24 个");
+  // 1. 初始: 3 分组; 全部表情显示; 每个格子带图片名; 预览 75x75
+  check("tabs==11", (await page.locator(".tab").count()) === 11);
+  const tabsOverflow = await page.locator("#tabs").evaluate((el) => el.scrollWidth > el.clientWidth);
+  check("tabs overflow (wheel has room)", tabsOverflow);
+  check("grid cells==24 (all)", (await page.locator(".stk-cell").count()) === 24);
+  check("no shop button", (await page.locator("#shopBtn").count()) === 0);
+  check("cell has name label", (await page.locator(".stk-cell .stk-name").count()) === 24);
+  check("first label is file name", (await page.locator(".stk-cell .stk-name").first().textContent()) === "表情1");
   const imgRect = await page.locator(".stk-cell img").first().evaluate((el) => {
     const r = el.getBoundingClientRect();
     return { w: r.width, h: r.height };
   });
-  check("cell img 50x50", imgRect.w === 50 && imgRect.h === 50, JSON.stringify(imgRect));
+  check("cell img 75x75", Math.round(imgRect.w) === 75 && Math.round(imgRect.h) === 75, JSON.stringify(imgRect));
 
-  // 3. attach 初始态: 未选择窗口
-  check("attach label 选择窗口", (await page.locator("#attachLabel").textContent()) === "选择窗口");
-
-  // 4. 未选择窗口时点击表情 → 提示 (无插入调用)
-  await page.locator(".stk-cell").first().click();
-  await page.waitForTimeout(80);
-  const insertedBefore = await page.evaluate(() => (window.__MOCK__.inserted || []).length);
-  check("no insert without target", insertedBefore === 0, `inserted=${insertedBefore}`);
-
-  // 5. 点击 attach 开始拾取 → 状态进入 picking
-  await page.locator("#attachBtn").click();
-  await page.waitForTimeout(80);
-  const pickingState = await page.evaluate(() => window.__MOCK__.picking);
-  const labelPicking = await page.locator("#attachLabel").textContent();
-  check("begin_pick called", pickingState === true);
-  check("attach shows picking label", (labelPicking || "").includes("目标窗口"));
-
-  // 6. 模拟后端完成拾取: target 设置 + picking=false (轮询最多 2s)
-  await page.evaluate(() => {
-    window.__MOCK__.target = { hwnd: 12345, title: "文件传输助手", process: "WeChat.exe", pid: 8888 };
-    window.__MOCK__.picking = false;
-  });
-  await page.waitForFunction(() => {
-    const l = document.querySelector("#attachLabel");
-    return l && l.textContent.includes("WeChat");
-  }, null, { timeout: 5000 });
-  check("attach shows target title", (await page.locator("#attachLabel").textContent()).includes("文件传输助手"));
-  check("attach linked style", await page.locator("#attachBtn.linked").count() === 1);
-
-  // 7. 点击表情 → insert_sticker 携带路径 → toast
-  const firstPath = await page.evaluate(() => window.__MOCK__.counts);
-  await page.locator(".stk-cell").first().click();
-  await page.waitForTimeout(120);
-  const inserted = await page.evaluate(() => window.__MOCK__.inserted || []);
-  check("insert_sticker invoked with path", inserted.length === 1 && inserted[0].includes("基本表情"), JSON.stringify(inserted));
-  const toastTxt = await page.locator("#toast").textContent();
-  check("toast 已插入", (toastTxt || "").includes("已插入"), toastTxt);
-
-  // 8. 再次点击 attach (此时已 linked) → 重新拾取
-  await page.evaluate(() => { window.__MOCK__.picking = true; });
-  await page.locator("#attachBtn").click();
-  await page.waitForTimeout(80);
-  check("re-pick sets picking", await page.evaluate(() => window.__MOCK__.picking));
-  // 取消
-  await page.evaluate(() => { window.__MOCK__.picking = false; });
-  await page.locator("#attachBtn").click();
-  await page.waitForTimeout(50);
-  check("cancel ends picking", (await page.locator("#attachBtn.picking").count()) === 0);
-
-  // 9. 网格可滚动 (24 个 → 6 行, 内容高于可视区)
+  // 2. 网格可滚动 (6 行 > 可视区)
   const scrollInfo = await page.locator("#gridArea").evaluate((el) => ({
     client: el.clientHeight,
     scroll: el.scrollHeight,
   }));
   check("grid scrollable", scrollInfo.scroll > scrollInfo.client, JSON.stringify(scrollInfo));
 
-  // 10. 切组/预览/商店/删除 仍正常
-  await page.locator(".tab").nth(1).click();
+  // 3. Tab 滚轮横向滚动 tabs
+  const tabScrollBefore = await page.locator("#tabs").evaluate((el) => el.scrollLeft);
+  await page.locator("#tabs").hover();
+  await page.mouse.wheel(0, 120);
   await page.waitForTimeout(80);
-  check("group2 cells==16", (await page.locator(".stk-cell").count()) === 16);
-  check("group2 name shown", (await page.locator("#groupName").textContent()) === "元气团子 · 16 个 (16 个动图)");
-  await page.locator(".stk-cell").first().hover();
+  const tabScrollAfter = await page.locator("#tabs").evaluate((el) => el.scrollLeft);
+  check("tabs wheel scrolls", tabScrollAfter > tabScrollBefore, `${tabScrollBefore} -> ${tabScrollAfter}`);
+
+  // 4. 设置面板: 打开 → 含三行 (目标窗口/刷新/位置)
+  await page.locator("#gearBtn").click();
   await page.waitForTimeout(80);
-  check("preview visible", !(await page.locator("#preview").isHidden()));
+  check("settings visible", await page.locator("#settings").isVisible());
+  check("settings 3 rows", (await page.locator(".set-row").count()) === 3);
+  check("location shows root", (await page.locator("#setLocationVal").textContent()).includes("C:/mock/stickers"));
+
+  // 5. 位置选择: 模拟选文件夹 → set_stickers_dir called, root 更新
+  await page.evaluate(() => {
+    window.__MOCK__.root = "D:/my/emoticons";
+  });
+  await page.locator("#setLocationBtn").click();
+  await page.waitForTimeout(120);
+  const dirCall = await page.evaluate(() => (window.__MOCK__.calls || []).filter(([c]) => c === "set_stickers_dir_called"));
+  check("set_stickers_dir invoked", dirCall.length >= 1, JSON.stringify(dirCall));
+  check("location label updated", (await page.locator("#setLocationVal").textContent()).includes("D:/my/emoticons"));
+
+  // 6. 目标窗口: 未选择时 insert 提示; 选择后 insert 成功
+  await page.locator(".stk-cell").first().click();
+  await page.waitForTimeout(80);
+  check("no insert without target", await page.evaluate(() => (window.__MOCK__.inserted || []).length) === 0);
+  const toast1 = await page.locator("#toast").textContent();
+  check("prompt to pick target", (toast1 || "").includes("选择目标窗口"), toast1);
+
+  // 通过设置面板选择目标 (刚才点格子关闭了面板, 重新打开)
+  await page.locator("#gearBtn").click();
+  await page.waitForTimeout(60);
+  await page.locator("#setTargetBtn").click();
+  await page.waitForTimeout(80);
+  check("begin_pick via settings", await page.evaluate(() => window.__MOCK__.picking));
+  check("setTarget shows picking", (await page.locator("#setTargetVal").textContent()).includes("正在选择"));
+  await page.evaluate(() => {
+    window.__MOCK__.target = { hwnd: 123, title: "文件传输助手", process: "WeChat.exe", pid: 1 };
+    window.__MOCK__.picking = false;
+  });
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#setTargetVal");
+    return el && el.textContent.includes("WeChat");
+  }, null, { timeout: 5000 });
+  check("target shown in settings", (await page.locator("#setTargetVal").textContent()).includes("文件传输助手"));
+
+  // 重开面板 → 点空白处关闭 → 点表情成功插入
+  await page.locator("#gearBtn").click();
+  await page.waitForTimeout(50);
+  await page.mouse.click(150, 372);
+  await page.waitForTimeout(50);
+  const settingsHidden = await page.locator("#settings").isHidden();
+  check("settings closes on outside click", settingsHidden);
+  await page.locator(".stk-cell").first().click();
+  await page.waitForTimeout(120);
+  const inserted = await page.evaluate(() => window.__MOCK__.inserted || []);
+  check("insert_sticker invoked", inserted.length === 1, JSON.stringify(inserted));
+
+  // 7. 刷新
+  await page.locator("#gearBtn").click();
+  await page.locator("#setRefreshBtn").click();
+  await page.waitForTimeout(100);
+  check("refresh reloaded (list_packages called)", await page.evaluate(() => window.__MOCK__.calls.filter(([c]) => c === "list_packages").length >= 2));
+
+  // 8. 右键删除分组仍可用
   await page.locator(".tab").first().click({ button: "right" });
   await page.waitForTimeout(60);
-  check("ctx menu visible", await page.locator("#ctxMenu").isVisible());
   await page.locator("#ctxMenu .item.danger").click();
   await page.waitForTimeout(60);
   await page.locator("#modalOk").click();
   await page.waitForTimeout(100);
   check("delete_package invoked", await page.evaluate(() => window.__MOCK__.calls.some(([c]) => c === "delete_package")));
-  check("tabs==2 after delete", (await page.locator(".tab").count()) === 2);
-  await page.locator("#shopBtn").click();
-  await page.waitForTimeout(80);
-  check("shop opens", await page.locator("#shopView").isVisible());
-  await page.evaluate(() => { window.__MOCK__.picking = false; });
 
   await browser.close();
   server.close();

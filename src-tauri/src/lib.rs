@@ -49,7 +49,7 @@ struct PackageInfo {
     shop: bool,
 }
 
-/// 表情包根目录: 优先环境变量 EMOTICON_STICKERS_DIR, 否则 appdata
+/// 表情包根目录: 环境变量 EMOTICON_STICKERS_DIR > 持久化配置 > appdata
 fn root_dir(app: &tauri::AppHandle) -> PathBuf {
     if let Ok(p) = std::env::var("EMOTICON_STICKERS_DIR") {
         let t = p.trim();
@@ -57,10 +57,47 @@ fn root_dir(app: &tauri::AppHandle) -> PathBuf {
             return PathBuf::from(t);
         }
     }
+    if let Ok(p) = std::fs::read_to_string(settings_file(app)) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&p) {
+            if let Some(dir) = v.get("stickersDir").and_then(|d| d.as_str()) {
+                let d = PathBuf::from(dir);
+                if d.is_dir() {
+                    return d;
+                }
+            }
+        }
+    }
     app.path()
         .app_data_dir()
         .expect("no app data dir")
         .join(ROOT_DIR)
+}
+
+fn settings_file(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_config_dir()
+        .expect("no app config dir")
+        .join("settings.json")
+}
+
+/// 选择/设置表情包根目录 (持久化到 settings.json)
+#[tauri::command]
+fn set_stickers_dir(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("路径为空".into());
+    }
+    let p = PathBuf::from(&path);
+    if !p.is_dir() {
+        fs::create_dir_all(&p).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    let file = settings_file(&app);
+    if let Some(parent) = file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let v = serde_json::json!({ "stickersDir": p.to_string_lossy() });
+    fs::write(&file, serde_json::to_string_pretty(&v).unwrap_or_default())
+        .map_err(|e| format!("保存配置失败: {e}"))?;
+    Ok(p.to_string_lossy().to_string())
 }
 
 fn valid_name(name: &str) -> Result<String, String> {
@@ -699,9 +736,11 @@ fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: St
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_root,
+            set_stickers_dir,
             list_packages,
             list_stickers,
             read_sticker,
