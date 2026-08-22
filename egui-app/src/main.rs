@@ -423,7 +423,8 @@ impl eframe::App for App {
                     let max_off = (total_w - avail_w).max(0.0);
                     let (row_rect, row_resp) = ui.allocate_exact_size(vec2(avail_w, 32.0), Sense::hover());
                     // 只有鼠标悬停在 Tab 栏上时才响应滚轮 (避免全局误滚)
-                    if max_off > 0.0 && row_resp.hovered() {
+                    let pointer_in = ui.rect_contains_pointer(row_rect);
+                    if max_off > 0.0 && pointer_in {
                         let dy = ui.input(|i| i.raw_scroll_delta.y);
                         if dy != 0.0 {
                             // 滚轮向上 -> 向左滚动
