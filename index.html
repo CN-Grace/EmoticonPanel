@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>表情面板</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div id="app">
+      <!-- 顶部: 表情输入条 -->
+      <div class="input-bar">
+        <div class="input-box" id="inputBox">
+          <div class="chips" id="inputChips"></div>
+          <span class="ph" id="inputPh">点按表情添加到输入框，⌫ 可删除，发送后清空</span>
+        </div>
+      </div>
+
+      <!-- 表情网格 + 翻页圆点 -->
+      <div class="grid-wrap">
+        <div class="grid-area" id="gridArea"></div>
+        <div class="page-dots" id="pageDots"></div>
+      </div>
+
+      <!-- 底部栏: 分组 Tab + 操作 + 发送 -->
+      <div class="bottom-bar">
+        <div class="tabs" id="tabs"></div>
+        <button class="icon-btn shop-entry" id="shopBtn" title="表情商店">＋</button>
+        <button class="icon-btn" id="refreshBtn" title="刷新表情包">⭮</button>
+        <span class="tabs-spacer"></span>
+        <button class="icon-btn del-btn" id="delBtn" title="删除一个">⌫</button>
+        <button class="send-btn" id="sendBtn" disabled>发送</button>
+      </div>
+
+      <!-- 悬浮大预览 -->
+      <div class="preview" id="preview" hidden><img id="previewImg" alt="" /></div>
+
+      <!-- 右键菜单 -->
+      <div class="ctx-menu" id="ctxMenu" hidden></div>
+
+      <!-- 商店浮层 -->
+      <div class="shop-view" id="shopView" hidden>
+        <div class="shop-head">
+          <button class="icon-btn" id="shopBack">← 返回</button>
+          <span class="shop-title">表情商店</span>
+          <span></span>
+        </div>
+        <div class="shop-hint" id="shopHint"></div>
+        <div class="shop-list" id="shopList"></div>
+      </div>
+
+      <!-- 确认弹窗 -->
+      <div class="modal-mask" id="modalMask" hidden>
+        <div class="modal">
+          <div class="modal-text" id="modalText"></div>
+          <div class="modal-btns">
+            <button class="m-btn" id="modalCancel">取消</button>
+            <button class="m-btn danger" id="modalOk">确认</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
+    </div>
+  </body>
+</html>
