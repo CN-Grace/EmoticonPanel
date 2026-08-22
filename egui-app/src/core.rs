@@ -544,20 +544,19 @@ pub fn insert_sticker(attach: &Attach, root: &Path, path: &Path) -> Result<(), S
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
     let is_png = ext_lower == "png";
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
-    let rgba = img.to_rgba8();
-    let (w, h) = (rgba.width(), rgba.height());
     let _ = root; // 路径已由 list_stickers 提供
+    let _ = &bytes;
 
     #[cfg(target_os = "windows")]
     unsafe {
+        // 只写"文件"类格式: CF_HDROP + 虚拟文件 + PNG 原始字节
+        // 绝不写 CF_DIB(白底合成位图) —— 微信等会优先读位图导致透明 PNG 变白底
         win::set_clipboard(|| {
             win::set_hdrop(&path.to_string_lossy())?;
             win::set_virtual_file(&bytes, &filename)?;
             if is_png || is_gif_file {
                 win::set_png_formats(&bytes)?;
             }
-            win::set_dib(&rgba, w, h)?;
             Ok(())
         })?;
     }
