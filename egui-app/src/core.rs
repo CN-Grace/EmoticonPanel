@@ -73,6 +73,22 @@ pub fn root_dir() -> PathBuf {
 }
 
 /// 设置表情包根目录并持久化
+fn read_settings() -> serde_json::Value {
+    fs::read_to_string(settings_file())
+        .ok()
+        .and_then(|p| serde_json::from_str(&p).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_settings(v: &serde_json::Value) -> Result<(), String> {
+    let file = settings_file();
+    if let Some(parent) = file.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&file, serde_json::to_string_pretty(v).unwrap_or_default())
+        .map_err(|e| format!("保存配置失败: {e}"))
+}
+
 pub fn set_stickers_dir(path: &str) -> Result<PathBuf, String> {
     if path.trim().is_empty() {
         return Err("路径为空".into());
@@ -81,14 +97,24 @@ pub fn set_stickers_dir(path: &str) -> Result<PathBuf, String> {
     if !p.is_dir() {
         fs::create_dir_all(&p).map_err(|e| format!("创建目录失败: {e}"))?;
     }
-    let file = settings_file();
-    if let Some(parent) = file.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let v = serde_json::json!({ "stickersDir": p.to_string_lossy() });
-    fs::write(&file, serde_json::to_string_pretty(&v).unwrap_or_default())
-        .map_err(|e| format!("保存配置失败: {e}"))?;
+    let mut v = read_settings();
+    v["stickersDir"] = serde_json::json!(p.to_string_lossy());
+    write_settings(&v)?;
     Ok(p)
+}
+
+/// 始终置顶 状态
+pub fn get_always_on_top() -> bool {
+    read_settings()
+        .get("alwaysOnTop")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn set_always_on_top(v: bool) -> Result<(), String> {
+    let mut s = read_settings();
+    s["alwaysOnTop"] = serde_json::json!(v);
+    write_settings(&s)
 }
 
 pub fn list_packages(root: &Path) -> Vec<Package> {

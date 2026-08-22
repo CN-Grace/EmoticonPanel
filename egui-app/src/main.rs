@@ -108,6 +108,7 @@ struct App {
     tab_cover: Vec<Option<TextureHandle>>,
     fallback: TextureHandle,
     show_settings: bool,
+    always_on_top: bool, // 设置: 窗口始终置顶
     menu: Option<(Pos2, usize)>, // 右键菜单位置 + 分组索引
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -124,6 +125,9 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        if core::get_always_on_top() {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        }
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         let fallback = cc
@@ -162,6 +166,7 @@ impl App {
             tab_cover: Vec::new(),
             fallback,
             show_settings: false,
+            always_on_top: core::get_always_on_top(),
             menu: None,
             toast: None,
             folder_rx: None,
@@ -640,6 +645,25 @@ impl eframe::App for App {
                                         if chip(ui, vec2(56.0, 28.0), "刷新", false).clicked() {
                                             self.refresh(ctx);
                                             self.toast = Some(("已刷新表情包".into(), std::time::Instant::now()));
+                                        }
+                                    });
+                                });
+                            });
+                            ui.add_space(8.0);
+
+                            // 始终置顶: 名+右切换按钮
+                            row_frame.clone().show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(name("始终置顶"));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let label = if self.always_on_top { "已开启" } else { "开启" };
+                                        if chip(ui, vec2(60.0, 28.0), label, !self.always_on_top).clicked() {
+                                            self.always_on_top = !self.always_on_top;
+                                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                                                if self.always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal },
+                                            ));
+                                            let _ = core::set_always_on_top(self.always_on_top);
+                                            self.toast = Some((format!("已{}置顶", if self.always_on_top { "开启" } else { "关闭" }), std::time::Instant::now()));
                                         }
                                     });
                                 });
