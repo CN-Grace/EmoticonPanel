@@ -5,7 +5,7 @@ mod core;
 
 use core::{Attach, Sticker};
 use egui::{
-    pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, Layout, Margin, Pos2, Rect,
+    pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, Layout, Margin, Pos2, Rect, RichText,
     Rounding, Sense, Stroke, TextureHandle, TextureOptions, Vec2, epaint::TextureId,
 };
 use std::collections::HashMap;
@@ -16,13 +16,14 @@ use std::time::Duration;
 
 const THUMB_MAX: u32 = 96;
 const PREVIEW_MAX: u32 = 400;
-const CELL_W: f32 = 79.0;
-const CELL_H: f32 = 98.0;
-const IMG: f32 = 75.0;
+const CELL_W: f32 = 76.0;
+const CELL_H: f32 = 97.0;
+const IMG: f32 = 72.0;
 const COLS: usize = 4;
-const W: f32 = 350.0;
-const H: f32 = 470.0;
+const W: f32 = 352.0;
+const H: f32 = 486.0;
 const BOTTOM_H: f32 = 46.0;
+const MAX_INFLIGHT: usize = 6;
 
 // 微信风格配色
 const C_WHITE: Color32 = Color32::WHITE;
@@ -68,13 +69,13 @@ fn decode_frames(bytes: &[u8], ctx: &egui::Context, max: u32, tag: &str) -> Opti
             delays.push(if d == 0 { 100 } else { ((n as f64 / d as f64) * 1000.0).max(20.0) as u64 });
             let buf = frame.into_buffer();
             let (nw, nh) = fit_dim(buf.width(), buf.height(), max);
-            let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Lanczos3);
+            let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
             frames.push(egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw()));
         }
     } else {
         let buf = image::load_from_memory(bytes).ok()?.to_rgba8();
         let (nw, nh) = fit_dim(buf.width(), buf.height(), max);
-        let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Lanczos3);
+        let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
         frames.push(egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw()));
         delays.push(0);
     }
@@ -111,6 +112,13 @@ struct App {
     hover_pv: Option<(Pos2, TextureId)>,
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    // 后台解码
+    pending: std::collections::VecDeque<(PathBuf, Vec<u8>)>,
+    inflight: usize,
+    done_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<TextureHandle>, Vec<u64>)>,
+    done_tx: std::sync::mpsc::Sender<(PathBuf, Vec<TextureHandle>, Vec<u64>)>,
+    tabs_off: f32,
+    tab_hover_last: Option<usize>,
 }
 
 impl App {
@@ -122,6 +130,7 @@ impl App {
             .load_texture("fb", egui::ColorImage::from_rgba_unmultiplied([4, 4], &[230; 64]), TextureOptions::LINEAR);
         let root = core::root_dir();
         let packages = core::list_packages(&root);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let mut a = Self {
             attach: Attach::default(),
             root,
@@ -137,6 +146,12 @@ impl App {
             hover_pv: None,
             toast: None,
             folder_rx: None,
+            pending: std::collections::VecDeque::new(),
+            inflight: 0,
+            done_rx,
+            done_tx,
+            tabs_off: 0.0,
+            tab_hover_last: None,
         };
         a.load_group(&cc.egui_ctx);
         a
@@ -150,27 +165,68 @@ impl App {
             .unwrap_or_default();
         self.thumbs.clear();
         self.previews.clear();
-        let paths: Vec<PathBuf> = self.stickers.iter().map(|s| s.path.clone()).collect();
+        self.pending.clear();
+        self.tabs_off = 0.0;
+        // 读字节并入队后台解码 (最后一张先排, 保证可视区先出)
+        let mut paths: Vec<PathBuf> = self.stickers.iter().map(|s| s.path.clone()).collect();
+        paths.reverse();
         for p in paths {
-            self.ensure_thumb(ctx, &p);
+            if let Ok(bytes) = std::fs::read(&p) {
+                self.pending.push_front((p, bytes));
+            }
         }
+        let _ = ctx;
         self.rebuild_tab_covers(ctx);
+    }
+
+    /// 每帧: 启动 ≤MAX_INFLIGHT 个解码线程 + 收完成结果
+    fn pump_decode(&mut self, ctx: &egui::Context) {
+        while self.inflight < MAX_INFLIGHT {
+            let Some((path, bytes)) = self.pending.pop_front() else { break };
+            let tx = self.done_tx.clone();
+            let ctx = ctx.clone();
+            let tag = path.to_string_lossy().to_string();
+            self.inflight += 1;
+            std::thread::spawn(move || {
+                let r = decode_frames(&bytes, &ctx, THUMB_MAX, &tag);
+                let (frames, delays) = match r {
+                    Some((f, d)) => (f, d),
+                    None => (Vec::new(), Vec::new()),
+                };
+                let _ = tx.send((path, frames, delays));
+            });
+        }
+        let mut got = 0;
+        while let Ok((path, frames, delays)) = self.done_rx.try_recv() {
+            self.inflight -= 1;
+            got += 1;
+            if !frames.is_empty() {
+                // 若是某组封面, 同时更新 tab_cover
+                for (i, p) in self.packages.iter().enumerate() {
+                    if let Some(cover) = &self.tab_cover[i] {
+                        if cover.id() == self.fallback.id() {
+                            if let Ok(ss) = core::list_stickers(&self.root, &p.name) {
+                                if ss.first().map(|f| f.path == path).unwrap_or(false) {
+                                    self.tab_cover[i] = Some(frames[0].clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                self.thumbs.insert(path, Avatar { frames, delays, current: 0, last_time: 0.0 });
+            }
+        }
+        if got > 0 || !self.pending.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     fn rebuild_tab_covers(&mut self, ctx: &egui::Context) {
         self.tab_cover.clear();
-        let names: Vec<String> = self.packages.iter().map(|p| p.name.clone()).collect();
-        for name in names {
-            let cover: Option<TextureHandle> = if let Ok(ss) = core::list_stickers(&self.root, &name) {
-                ss.first().and_then(|st| {
-                    self.ensure_thumb(ctx, &st.path);
-                    self.thumbs.get(&st.path).map(|at| at.frames[at.current].clone())
-                })
-            } else {
-                None
-            };
-            self.tab_cover.push(cover);
+        for _ in self.packages.iter() {
+            self.tab_cover.push(Some(self.fallback.clone()));
         }
+        ctx.request_repaint();
     }
 
     fn refresh(&mut self, ctx: &egui::Context) {
@@ -199,7 +255,7 @@ impl App {
                 if let Ok(img) = image::load_from_memory(&bytes) {
                     let buf = img.to_rgba8();
                     let (nw, nh) = fit_dim(buf.width(), buf.height(), PREVIEW_MAX);
-                    let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Lanczos3);
+                    let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
                     let color = egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw());
                     let h = ctx.load_texture(format!("pv_{}", st.path.to_string_lossy()), color, TextureOptions::LINEAR);
                     self.previews.insert(st.path.clone(), h);
@@ -235,25 +291,6 @@ impl App {
         if need {
             ctx.request_repaint_after(Duration::from_millis(min_delay.min(100)));
         }
-    }
-
-    // ---------- 绘制辅助 ----------
-
-    fn chip(&self, ui: &mut egui::Ui, size: Vec2, text: &str, filled: bool) -> egui::Response {
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-        let painter = ui.painter();
-        let rounding = Rounding::same(6.0);
-        let bg = if resp.hovered() {
-            C_HOVER
-        } else if filled {
-            C_GREEN
-        } else {
-            C_WHITE
-        };
-        let fg = if filled { C_WHITE } else { C_GREEN };
-        painter.rect(rect, rounding, if filled { bg } else if resp.hovered() { C_HOVER } else { C_WHITE }, Stroke::new(1.0, C_GREEN));
-        painter.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), fg);
-        resp
     }
 
     fn sticker_cell(
@@ -328,6 +365,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_decode(ctx);
         self.advance_animations(ctx);
         if self.attach.picking.load(std::sync::atomic::Ordering::SeqCst) {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -349,35 +387,77 @@ impl eframe::App for App {
             .frame(Frame::none().fill(C_BAR).inner_margin(Margin::symmetric(8.0, 6.0)).stroke(Stroke::new(1.0, C_LINE)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let mut clicked = None;
-                    let mut del = None;
-                    let mut delname = String::new();
                     let mut names: Vec<String> = Vec::new();
                     let mut gif_counts: Vec<usize> = Vec::new();
                     for p in self.packages.iter() {
                         names.push(p.name.clone());
                         gif_counts.push(p.gif_count);
                     }
-                    egui::ScrollArea::horizontal().id_salt("tabs").show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add_space(2.0);
-                            let mut right_clicked: Option<(Pos2, usize)> = None;
-                            for (i, n) in names.iter().enumerate() {
-                                let resp = self.draw_tab_chip(ui, ctx, i, n, gif_counts[i], self.current == i);
-                                if resp.clicked() {
-                                    clicked = Some(i);
-                                }
-                                if resp.secondary_clicked() {
-                                    right_clicked = Some((ctx.pointer_latest_pos().unwrap_or(ui.min_rect().left_top()), i));
-                                }
-                            }
-                            if let Some((pos, i)) = right_clicked {
-                                del = Some(i);
-                                delname = names[i].clone();
-                                self.menu = Some((pos, i));
-                            }
-                        });
-                    });
+                    // ---- Tab 自绘 + 滚轮横向滚动 ----
+                    let avail_w = ui.available_width() - 40.0; // 留 ⚙ 位置
+                    let per = 36.0;
+                    let total_w = names.len() as f32 * per - 4.0;
+                    let max_off = (total_w - avail_w).max(0.0);
+                    if max_off > 0.0 {
+                        let dy = ui.input(|i| i.raw_scroll_delta.y);
+                        if dy != 0.0 {
+                            self.tabs_off = (self.tabs_off + dy).clamp(0.0, max_off);
+                            // 平滑滚轮用 raw; 触控板平滑滚动同样生效
+                        }
+                    } else {
+                        self.tabs_off = 0.0;
+                    }
+                    let (row_rect, row_resp) = ui.allocate_exact_size(vec2(avail_w, 32.0), Sense::hover());
+                    let painter = ui.painter_at(row_rect);
+                    let mut clicked = None;
+                    let mut right_clicked = None;
+                    let mut hovered_idx = None;
+                    for (i, n) in names.iter().enumerate() {
+                        let x = 2.0 + i as f32 * per - self.tabs_off;
+                        let chip_rect = Rect::from_min_size(pos2(row_rect.min.x + x, row_rect.min.y), vec2(32.0, 32.0));
+                        if !chip_rect.intersects(row_rect) {
+                            continue;
+                        }
+                        let resp = ui.interact(chip_rect, Id::new(("tab", i)), Sense::click());
+                        let active = self.current == i;
+                        let (fill, stroke) = if active {
+                            (C_WHITE, Stroke::new(1.0, C_LINE))
+                        } else if resp.hovered() {
+                            (Color32::from_rgb(236, 236, 236), Stroke::NONE)
+                        } else {
+                            (Color32::TRANSPARENT, Stroke::NONE)
+                        };
+                        painter.rect(chip_rect, Rounding::same(6.0), fill, stroke);
+                        let img_id = self
+                            .tab_cover
+                            .get(i)
+                            .and_then(|c| c.as_ref())
+                            .map(|h| h.id())
+                            .unwrap_or(self.fallback.id());
+                        let ir = Rect::from_center_size(chip_rect.center(), vec2(26.0, 26.0));
+                        painter.image(img_id, ir, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), C_WHITE);
+                        if gif_counts[i] > 0 {
+                            let b = Rect::from_min_size(pos2(chip_rect.right() - 18.0, chip_rect.bottom() - 12.0), vec2(17.0, 11.0));
+                            painter.rect(b, Rounding::same(3.0), C_ORANGE, Stroke::NONE);
+                            painter.text(b.center(), Align2::CENTER_CENTER, "GIF", FontId::proportional(7.0), C_WHITE);
+                        }
+                        if resp.clicked() {
+                            clicked = Some(i);
+                        }
+                        if resp.secondary_clicked() {
+                            right_clicked = Some((ctx.pointer_latest_pos().unwrap_or(row_rect.left_top()), i));
+                        }
+                        if resp.hovered() {
+                            hovered_idx = Some(i);
+                        }
+                    }
+                    if hovered_idx != self.tab_hover_last {
+                        self.tab_hover_last = hovered_idx;
+                        if let Some(i) = hovered_idx {
+                            ui.output_mut(|o| o.cursor_icon = egui::CursorIcon::PointingHand);
+                        }
+                    }
+                    ui.allocate_space(vec2(0.0, 0.0));
                     // ⚙ 按钮
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let (g, g_resp) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
@@ -392,7 +472,10 @@ impl eframe::App for App {
                         self.current = i;
                         self.load_group(ctx);
                     }
-                    let _ = del;
+                    if let Some((pos, i)) = right_clicked {
+                        self.menu = Some((pos, i));
+                    }
+                    let _ = row_resp;
                 });
             });
 
@@ -433,7 +516,7 @@ impl eframe::App for App {
             }
         }
 
-        // ---------- 设置面板 (自绘浮层) ----------
+        // ---------- 设置面板 (自绘浮层, 行区块背景) ----------
         if self.show_settings {
             egui::Area::new(Id::new("settings"))
                 .anchor(Align2::RIGHT_BOTTOM, vec2(-8.0, -(BOTTOM_H + 8.0)))
@@ -443,100 +526,115 @@ impl eframe::App for App {
                         .fill(C_WHITE)
                         .rounding(10.0)
                         .stroke(Stroke::new(1.0, C_LINE))
-                        .inner_margin(Margin::same(8.0))
+                        .inner_margin(Margin::same(10.0))
                         .shadow(egui::epaint::Shadow { offset: vec2(0.0, 4.0), blur: 18.0, spread: 0.0, color: Color32::from_black_alpha(46) })
                         .show(ui, |ui| {
-                            ui.set_width(296.0);
+                            ui.set_width(316.0);
+                            // 行区块: 浅灰圆角背景, 突出按钮
+                            let row = |ui: &mut egui::Ui, label: &str, value: String, btn: &str, filled: bool, need_val: bool, cap: usize| {
+                                let mut clicked = false;
+                                Frame::none()
+                                    .fill(Color32::from_rgb(245, 245, 245))
+                                    .rounding(8.0)
+                                    .inner_margin(Margin::symmetric(10.0, 7.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(label).size(13.0).color(C_TEXT));
+                                            let val = trunc(&value, cap);
+                                            ui.add_sized([130.0, 22.0], egui::Label::new(RichText::new(if need_val { &val } else { "" }).size(12.0).color(if need_val { C_TEXT } else { C_DIM })).truncate());
+                                            if chip(ui, vec2(62.0, 28.0), btn, filled).clicked() {
+                                                clicked = true;
+                                            }
+                                        });
+                                    });
+                                clicked
+                            };
+
                             // 目标窗口
-                            ui.horizontal(|ui| {
-                                ui.add_sized([62.0, 20.0], egui::Label::new(RichText_13("目标窗口")).truncate());
-                                let t = self.attach.target.lock().unwrap().clone();
-                                let picking = self.attach.picking.load(std::sync::atomic::Ordering::SeqCst);
-                                let status = if picking {
-                                    "正在选择…点击目标窗口".to_string()
-                                } else if let Some(t) = &t {
-                                    format!("{} · {}", t.process, trunc(&t.title, 10))
-                                } else {
-                                    "未选择".to_string()
-                                };
-                                ui.add_sized([150.0, 20.0], egui::Label::new(RichText_11(&status)).truncate());
+                            let t = self.attach.target.lock().unwrap().clone();
+                            let picking = self.attach.picking.load(std::sync::atomic::Ordering::SeqCst);
+                            let status = if picking {
+                                "正在选择…点击目标窗口".to_string()
+                            } else if let Some(t) = &t {
+                                format!("{} · {}", t.process, trunc(&t.title, 8))
+                            } else {
+                                "未选择".to_string()
+                            };
+                            if row(ui, "目标窗口", status, if picking { "取消" } else { if t.is_some() { "重选" } else { "选择" } }, !picking, false, 16) {
                                 if picking {
-                                    if self.chip(ui, vec2(56.0, 26.0), "取消", false).clicked() {
-                                        core::cancel_pick(&self.attach);
-                                    }
-                                } else if self.chip(ui, vec2(56.0, 26.0), if t.is_some() { "重选" } else { "选择" }, true).clicked() {
+                                    core::cancel_pick(&self.attach);
+                                } else {
                                     core::begin_pick(&self.attach);
                                     self.toast = Some(("请在 15 秒内点击目标窗口".into(), std::time::Instant::now()));
                                 }
-                            });
-                            let mut n = 12.0;
-                            ui.add_space(n);
+                            }
+                            ui.add_space(8.0);
                             // 刷新
-                            ui.horizontal(|ui| {
-                                ui.add_sized([62.0, 20.0], egui::Label::new(RichText_13("刷新表情包")).truncate());
-                                ui.add_sized([150.0, 20.0], egui::Label::new(RichText_11("重新扫描分组")));
-                                if self.chip(ui, vec2(56.0, 26.0), "刷新", false).clicked() {
-                                    self.refresh(ctx);
-                                    self.toast = Some(("已刷新表情包".into(), std::time::Instant::now()));
-                                }
-                            });
-                            ui.add_space(n);
+                            if row(ui, "刷新表情包", "重新扫描分组".to_string(), "刷新", false, false, 10) {
+                                self.refresh(ctx);
+                                self.toast = Some(("已刷新表情包".into(), std::time::Instant::now()));
+                            }
+                            ui.add_space(8.0);
                             // 位置
-                            ui.horizontal(|ui| {
-                                ui.add_sized([62.0, 20.0], egui::Label::new(RichText_13("表情包位置")).truncate());
-                                ui.add_sized([150.0, 20.0], egui::Label::new(RichText_11(&trunc(&self.root.to_string_lossy(), 16))).truncate());
-                                if self.chip(ui, vec2(76.0, 26.0), "选择文件夹", false).clicked() {
-                                    let (tx, rx) = mpsc::channel();
-                                    self.folder_rx = Some(rx);
-                                    std::thread::spawn(move || {
-                                        let dir = rfd::FileDialog::new().set_title("选择表情包文件夹").pick_folder();
-                                        let _ = tx.send(dir);
-                                    });
-                                }
-                            });
+                            if row(ui, "表情包位置", self.root.to_string_lossy().to_string(), "选文件夹", false, true, 16) {
+                                let (tx, rx) = mpsc::channel();
+                                self.folder_rx = Some(rx);
+                                std::thread::spawn(move || {
+                                    let dir = rfd::FileDialog::new().set_title("选择表情包文件夹").pick_folder();
+                                    let _ = tx.send(dir);
+                                });
+                            }
                         });
                     ui.allocate_space(vec2(0.0, 6.0));
                 });
         }
 
-        // ---------- 网格 ----------
+        // ---------- 网格 (Grid 固定列宽对齐, 隐藏滚动条) ----------
         egui::CentralPanel::default()
             .frame(Frame::none().fill(C_WHITE))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().id_salt("grid").auto_shrink([false, false]).show(ui, |ui| {
-                    ui.add_space(6.0);
-                    let stickers = self.stickers.clone();
-                    let mut insert_err: Option<String> = None;
-                    for chunk in stickers.chunks(COLS) {
-                        ui.horizontal(|ui| {
-                            let total_w = (COLS as f32) * CELL_W;
-                            ui.add_space((ui.available_width().max(0.0) - total_w) / 2.0);
-                            for st in chunk {
-                                let resp = self.sticker_cell(ui, ctx, st);
-                                if resp.clicked() {
-                                    match core::insert_sticker(&self.attach, &self.root, &st.path) {
-                                        Ok(()) => {
-                                            let proc = self.attach.target.lock().unwrap().clone().map(|t| t.process).unwrap_or_default();
-                                            self.toast = Some((format!("已插入 → {proc}"), std::time::Instant::now()));
-                                        }
-                                        Err(e) => {
-                                            insert_err = Some(e);
+                egui::ScrollArea::vertical()
+                    .id_salt("grid")
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .show(ui, |ui| {
+                        ui.add_space(6.0);
+                        let stickers = self.stickers.clone();
+                        let mut insert_err: Option<String> = None;
+                        egui::Grid::new("stkgrid")
+                            .num_columns(COLS)
+                            .min_col_width(CELL_W)
+                            .max_col_width(CELL_W)
+                            .spacing(vec2(5.0, 0.0))
+                            .show(ui, |ui| {
+                                for (i, st) in stickers.iter().enumerate() {
+                                    let resp = self.sticker_cell(ui, ctx, st);
+                                    if resp.clicked() {
+                                        match core::insert_sticker(&self.attach, &self.root, &st.path) {
+                                            Ok(()) => {
+                                                let proc = self.attach.target.lock().unwrap().clone().map(|t| t.process).unwrap_or_default();
+                                                self.toast = Some((format!("已插入 → {proc}"), std::time::Instant::now()));
+                                            }
+                                            Err(e) => {
+                                                insert_err = Some(e);
+                                            }
                                         }
                                     }
+                                    if (i + 1) % COLS == 0 {
+                                        ui.end_row();
+                                    }
                                 }
-                            }
-                        });
-                    }
-                    if let Some(e) = insert_err {
-                        self.toast = Some((e, std::time::Instant::now()));
-                    }
-                    if self.stickers.is_empty() {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(RichText_13("还没有表情包 — 在 ⚙ 设置里选择位置或刷新").colored_opt(C_DIM));
-                        });
-                    }
-                    ui.add_space(10.0);
-                });
+                            });
+                        if let Some(e) = insert_err {
+                            self.toast = Some((e, std::time::Instant::now()));
+                        }
+                        if self.stickers.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(RichText_13("还没有表情包 — 在 ⚙ 设置里选择位置或刷新").colored_opt(C_DIM));
+                            });
+                        }
+                        ui.add_space(10.0);
+                    });
             });
 
         // ---------- hover 大预览 ----------
@@ -610,6 +708,21 @@ impl RichTextExt for egui::RichText {
     fn colored(self, c: Color32) -> egui::RichText {
         self.color(c)
     }
+}
+
+fn chip(ui: &mut egui::Ui, size: Vec2, text: &str, filled: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter();
+    let r = Rounding::same(6.0);
+    let (fill, fg, stroke) = if filled {
+        (C_GREEN, C_WHITE, Stroke::new(1.0, C_GREEN))
+    } else {
+        let fill = if resp.hovered() { Color32::from_rgb(236, 236, 236) } else { C_WHITE };
+        (fill, C_GREEN, Stroke::new(1.0, C_GREEN))
+    };
+    painter.rect(rect, r, fill, stroke);
+    painter.text(rect.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), fg);
+    resp
 }
 
 fn install_fonts(ctx: &egui::Context) {
