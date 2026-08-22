@@ -717,8 +717,7 @@ fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: St
             if is_png || is_gif_file {
                 win::set_png_formats(&bytes)?;
             }
-            // 4) CF_DIB 兜底位图: BGRA + 白底合成 (仅给不识别文件的程序)
-            win::set_dib(&rgba, w, h)?;
+            // 4) 绝不写 CF_DIB(白底合成位图): 微信等优先读位图导致透明 PNG 变白底
             Ok(())
         })?;
     }
