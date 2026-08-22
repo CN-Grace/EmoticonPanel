@@ -1,8 +1,10 @@
-// 表情面板后端: 表情包扫描 / 图片读取 / 商店安装 / 分组删除
+// 表情面板后端: 表情包扫描 / 读取 / 商店安装 / 分组删除 + attach 目标窗口后点击表情插入输入框
 use base64::Engine;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 const ROOT_DIR: &str = "stickers";
@@ -22,7 +24,6 @@ fn is_gif(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 封面文件 (cover.<ext>) 不计入表情网格
 fn is_cover(path: &Path) -> bool {
     path.file_stem()
         .and_then(|s| s.to_str())
@@ -33,7 +34,7 @@ fn is_cover(path: &Path) -> bool {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StickerInfo {
-    url: String, // 绝对路径, 前端用它调 read_sticker
+    url: String,
     name: String,
     is_gif: bool,
 }
@@ -117,11 +118,7 @@ fn scan_dir_packages(root: &Path, shop: bool) -> Vec<PackageInfo> {
                 .to_lowercase()
                 .cmp(&b.file_name().and_then(|s| s.to_str()).unwrap_or("").to_lowercase())
         });
-        let cover = all
-            .iter()
-            .find(|p| is_cover(p))
-            .or_else(|| all.first())
-            .cloned();
+        let cover = all.iter().find(|p| is_cover(p)).or_else(|| all.first()).cloned();
         let files: Vec<PathBuf> = all.into_iter().filter(|p| !is_cover(p)).collect();
         if files.is_empty() {
             continue;
@@ -153,51 +150,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// 首次运行: 把内置示例表情包铺到用户表情根目录 (不覆盖已存在的包)
-fn seed_samples(app: &tauri::AppHandle) {
-    if std::env::var("EMOTICON_STICKERS_DIR").map(|s| !s.trim().is_empty()).unwrap_or(false) {
-        return; // 用户显式指定目录时不播种
-    }
-    let root = root_dir(app);
-    let _ = fs::create_dir_all(&root);
-
-    // 候选素材源: 资源目录(dev/release 由 tauri 放置) / 编译期 crate 目录(纯 cargo 构建兜底)
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(res) = app.path().resource_dir() {
-        candidates.push(res.join(ROOT_DIR));
-    }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(ROOT_DIR));
-
-    for cand in candidates {
-        if !cand.is_dir() {
-            continue;
-        }
-        // 示例分组 -> 根目录
-        let samples_src = cand.join("samples");
-        if samples_src.is_dir() {
-            if let Ok(rd) = fs::read_dir(&samples_src) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if !p.is_dir() {
-                        continue;
-                    }
-                    let name = e.file_name();
-                    let dst = root.join(&name);
-                    if !dst.exists() {
-                        let _ = copy_dir_recursive(&p, &dst);
-                    }
-                }
-            }
-        }
-        // 商店 -> 根目录/shop
-        let shop_src = cand.join(SHOP_DIR);
-        let shop_dst = root.join(SHOP_DIR);
-        if shop_src.is_dir() && !shop_dst.exists() {
-            let _ = copy_dir_recursive(&shop_src, &shop_dst);
-        }
-        break; // 第一个存在的素材源即可
-    }
-}
+// ---------- 表情包命令 ----------
 
 #[tauri::command]
 fn get_root(app: tauri::AppHandle) -> String {
@@ -240,13 +193,11 @@ fn list_stickers(app: tauri::AppHandle, package: String) -> Result<Vec<StickerIn
         .collect())
 }
 
-#[tauri::command]
-fn read_sticker(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    let root = root_dir(&app);
-    let p = PathBuf::from(&path);
+fn read_file_safe(root: &Path, path: &str) -> Result<Vec<u8>, String> {
+    let p = PathBuf::from(path);
     let ok = p.is_absolute()
-        && std::fs::canonicalize(&root)
-            .map(|cr| std::fs::canonicalize(&p).map(|cp| cp.starts_with(&cr)).unwrap_or(false))
+        && fs::canonicalize(root)
+            .map(|cr| fs::canonicalize(&p).map(|cp| cp.starts_with(&cr)).unwrap_or(false))
             .unwrap_or(false);
     if !ok {
         return Err("非法的文件路径".into());
@@ -255,6 +206,14 @@ fn read_sticker(app: tauri::AppHandle, path: String) -> Result<String, String> {
     if bytes.is_empty() {
         return Err("空文件".into());
     }
+    Ok(bytes)
+}
+
+#[tauri::command]
+fn read_sticker(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    let root = root_dir(&app);
+    let bytes = read_file_safe(&root, &path)?;
+    let p = PathBuf::from(&path);
     let mime = match p
         .extension()
         .and_then(|e| e.to_str())
@@ -314,14 +273,366 @@ fn reveal_root(app: tauri::AppHandle) -> Result<(), String> {
     tauri_plugin_opener::reveal_item_in_dir(&root).map_err(|e| e.to_string())
 }
 
+// ---------- attach 目标窗口 + 插入 ----------
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetInfo {
+    hwnd: isize,
+    title: String,
+    process: String,
+    pid: u32,
+}
+
+struct AppState {
+    target: Arc<Mutex<Option<TargetInfo>>>,
+    picking: Arc<AtomicBool>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            target: Arc::new(Mutex::new(None)),
+            picking: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod win {
+    use super::TargetInfo;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::Path;
+    use tauri::Manager;
+    use windows::Win32::Foundation::{CloseHandle, HWND};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
+        ShowWindow, SW_RESTORE,
+    };
+    use windows::core::PWSTR;
+
+    pub fn self_hwnd(app: &tauri::AppHandle) -> isize {
+        app.get_webview_window("main")
+            .and_then(|w| w.hwnd().ok())
+            .map(|h| h.0 as isize)
+            .unwrap_or(0)
+    }
+
+    pub fn foreground_hwnd() -> isize {
+        unsafe { GetForegroundWindow().0 as isize }
+    }
+
+    pub fn capture_target(hwnd: isize) -> Option<TargetInfo> {
+        let h = HWND(hwnd as *mut _);
+        // 标题
+        let mut buf = vec![0u16; 512];
+        let len = unsafe { GetWindowTextW(h, &mut buf) };
+        let title = if len > 0 {
+            String::from_utf16_lossy(&buf[..len as usize])
+        } else {
+            String::new()
+        };
+        // pid + 进程名
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(h, Some(&mut pid as *mut u32)); }
+        let process = process_name(pid);
+        if title.trim().is_empty() && process.is_empty() {
+            return None;
+        }
+        Some(TargetInfo {
+            hwnd,
+            title,
+            process,
+            pid,
+        })
+    }
+
+    fn process_name(pid: u32) -> String {
+        if pid == 0 {
+            return String::new();
+        }
+        unsafe {
+            let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+                return String::new();
+            };
+            let mut buf = vec![0u16; 1024];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buf.as_mut_ptr()),
+                &mut size as *mut u32,
+            );
+            let _ = CloseHandle(handle);
+            if ok.is_ok() && size > 0 {
+                let name = OsString::from_wide(&buf[..size as usize]).to_string_lossy().to_string();
+                return Path::file_name(name.as_ref())
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or(name);
+            }
+            String::new()
+        }
+    }
+
+    /// 激活目标窗口并发送 Ctrl+V
+    pub fn activate_and_paste(hwnd: isize) -> Result<(), String> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CONTROL,
+            VK_MENU, VK_V,
+        };
+        let hwnd = HWND(hwnd as *mut _);
+        unsafe {
+            // Alt 空点一次, 解除其他进程的前台锁定
+            let _ = keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY, 0);
+            let _ = keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+            if IsIconic(hwnd).as_bool() {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(hwnd).as_bool();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(140));
+        unsafe {
+            let _ = keybd_event(VK_CONTROL.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+            let _ = keybd_event(VK_V.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+            let _ = keybd_event(VK_V.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+            let _ = keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        }
+        Ok(())
+    }
+
+    // ---------- 剪贴板 ----------
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    unsafe fn set_data(format: u32, bytes: &[u8]) -> Result<(), String> {
+        let h = GlobalAlloc(GMEM_MOVEABLE, bytes.len()).map_err(|e| format!("GlobalAlloc: {e}"))?;
+        let ptr = GlobalLock(h);
+        if ptr.is_null() {
+            return Err("GlobalLock failed".into());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+        let _ = GlobalUnlock(h);
+        SetClipboardData(format, HANDLE(h.0)).map_err(|e| format!("SetClipboardData: {e}"))?;
+        Ok(())
+    }
+
+    #[repr(C)]
+    struct BITMAPINFOHEADER {
+        bi_size: u32,
+        bi_width: i32,
+        bi_height: i32,
+        bi_planes: u16,
+        bi_bit_count: u16,
+        bi_compression: u32,
+        bi_size_image: u32,
+        bi_xpels_per_meter: i32,
+        bi_ypels_per_meter: i32,
+        bi_clr_used: u32,
+        bi_clr_important: u32,
+    }
+
+    /// 把 RGBA 像素写为 CF_DIB (32bpp BGRA, 顶底翻转)
+    pub unsafe fn set_dib(rgba: &[u8], w: u32, h: u32) -> Result<(), String> {
+        let header = BITMAPINFOHEADER {
+            bi_size: 40,
+            bi_width: w as i32,
+            bi_height: -(h as i32), // 顶-底
+            bi_planes: 1,
+            bi_bit_count: 32,
+            bi_compression: 0, // BI_RGB
+            bi_size_image: w * h * 4,
+            bi_xpels_per_meter: 0,
+            bi_ypels_per_meter: 0,
+            bi_clr_used: 0,
+            bi_clr_important: 0,
+        };
+        let hb = unsafe {
+            let h = GlobalAlloc(GMEM_MOVEABLE, 40 + rgba.len()).map_err(|e| format!("GlobalAlloc: {e}"))?;
+            let ptr = GlobalLock(h);
+            if ptr.is_null() {
+                return Err("GlobalLock failed".into());
+            }
+            std::ptr::copy_nonoverlapping((&header as *const BITMAPINFOHEADER) as *const u8, ptr as *mut u8, 40);
+            // RGBA -> 存 BGRA 同布局 (top-down 负高度, 低位字节优先 = B) 直接拷贝
+            std::ptr::copy_nonoverlapping(rgba.as_ptr(), (ptr as *mut u8).add(40), rgba.len());
+            let _ = GlobalUnlock(h);
+            h
+        };
+        SetClipboardData(8 /*CF_DIB*/, HANDLE(hb.0)).map_err(|e| format!("SetClipboardData CF_DIB: {e}"))?;
+        Ok(())
+    }
+
+    #[repr(C)]
+    struct FILEDESCRIPTORW {
+        dw_flags: u32,
+        clsid: [u8; 16],
+        sizel: (i32, i32),
+        pointl: (i32, i32),
+        dw_file_attributes: u32,
+        ft_creation_time: [u64; 1],
+        ft_last_access_time: [u64; 1],
+        ft_last_write_time: [u64; 1],
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        c_file_name: [u16; 260],
+    }
+
+    #[repr(C)]
+    struct FILEGROUPDESCRIPTORW {
+        c_items: u32,
+        fgd: [FILEDESCRIPTORW; 1],
+    }
+
+    /// GIF: FileGroupDescriptorW + FileContents (资源管理器"复制文件"格式)
+    /// 普通剪贴板客户端看 CF_DIB, 微信/QQ 等识别虚拟文件可保留动画
+    pub unsafe fn set_gif(bytes: &[u8], filename: &str) -> Result<(), String> {
+        let fdw = RegisterClipboardFormatW(windows::core::w!("FileGroupDescriptorW"));
+        let fc = RegisterClipboardFormatW(windows::core::w!("FileContents"));
+        let mut name = [0u16; 260];
+        for (i, c) in filename.encode_utf16().take(259).enumerate() {
+            name[i] = c;
+        }
+        let desc = FILEGROUPDESCRIPTORW {
+            c_items: 1,
+            fgd: [FILEDESCRIPTORW {
+                dw_flags: 0x4 /*FD_ATTRIBUTES*/ | 0x40 /*FD_FILESIZE*/,
+                clsid: [0; 16],
+                sizel: (0, 0),
+                pointl: (0, 0),
+                dw_file_attributes: 0x80 /*FILE_ATTRIBUTE_NORMAL*/,
+                ft_creation_time: [0; 1],
+                ft_last_access_time: [0; 1],
+                ft_last_write_time: [0; 1],
+                n_file_size_high: (bytes.len() >> 32) as u32,
+                n_file_size_low: bytes.len() as u32,
+                c_file_name: name,
+            }],
+        };
+        let desc_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&desc as *const FILEGROUPDESCRIPTORW) as *const u8,
+                std::mem::size_of::<FILEGROUPDESCRIPTORW>(),
+            )
+        };
+        set_data(fdw, desc_bytes)?;
+        set_data(fc, bytes)?;
+        Ok(())
+    }
+
+    /// 打开剪贴板会话 (带重试), 设置回调内容
+    pub unsafe fn set_clipboard(f: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        for attempt in 0..8 {
+            if OpenClipboard(None).is_ok() {
+                let _ = EmptyClipboard();
+                let r = f();
+                let _ = CloseClipboard();
+                return r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40 * (attempt + 1)));
+        }
+        Err("无法打开剪贴板 (可能被占用)".into())
+    }
+}
+
+#[tauri::command]
+fn get_target(state: tauri::State<AppState>) -> Option<TargetInfo> {
+    state.target.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn is_picking(state: tauri::State<AppState>) -> bool {
+    state.picking.load(Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn begin_pick(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<(), String> {
+    let picking = state.picking.clone();
+    if picking.swap(true, Ordering::SeqCst) {
+        return Err("已在拾取中".into());
+    }
+    let target = state.target.clone();
+    let self_hwnd = win::self_hwnd(&app);
+    std::thread::spawn(move || {
+        let timer = std::time::Instant::now();
+        let mut last = 0isize;
+        let timeout = std::time::Duration::from_secs(15);
+        while picking.load(Ordering::SeqCst) && timer.elapsed() < timeout {
+            let fg = win::foreground_hwnd();
+            if fg != 0 && fg != self_hwnd && fg != last {
+                if let Some(info) = win::capture_target(fg) {
+                    *target.lock().unwrap() = Some(info);
+                    break;
+                }
+            }
+            last = fg;
+            std::thread::sleep(std::time::Duration::from_millis(180));
+        }
+        picking.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_pick(state: tauri::State<AppState>) {
+    state.picking.store(false, Ordering::SeqCst);
+}
+
+/// 点击表情: 写入剪贴板并 Ctrl+V 到目标窗口的输入框
+#[tauri::command]
+fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: String) -> Result<(), String> {
+    let target = state
+        .target
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or("请先选择目标窗口")?;
+    let root = root_dir(&app);
+    let bytes = read_file_safe(&root, &path)?;
+    let p = PathBuf::from(&path);
+    let filename = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("sticker")
+        .to_string();
+    let is_gif_file = is_gif(&p);
+
+    // 解码为 RGBA (gif 取第一帧)
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+
+    #[cfg(target_os = "windows")]
+    unsafe {
+        win::set_clipboard(|| {
+            win::set_dib(&rgba, w, h)?;
+            if is_gif_file {
+                win::set_gif(&bytes, &filename)?;
+            }
+            Ok(())
+        })?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (w, h, is_gif_file, filename);
+        return Err("当前平台不支持插入".into());
+    }
+
+    win::activate_and_paste(target.hwnd)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
-            seed_samples(app.handle());
-            Ok(())
-        })
+        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_root,
             list_packages,
@@ -330,7 +641,12 @@ pub fn run() {
             shop_list,
             install_package,
             delete_package,
-            reveal_root
+            reveal_root,
+            get_target,
+            is_picking,
+            begin_pick,
+            cancel_pick,
+            insert_sticker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -341,7 +657,7 @@ mod tests {
     use super::*;
 
     fn tmp_src(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("emoji_rs_test_{tag}"));
+        let d = std::env::temp_dir().join(format!("emoji_rs_test_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -358,7 +674,7 @@ mod tests {
         let info = scan_dir_packages(&root, false);
         assert_eq!(info.len(), 1);
         assert_eq!(info[0].name, "元气团子");
-        assert_eq!(info[0].count, 2); // 不包含独立 cover? cover 也计入
+        assert_eq!(info[0].count, 2);
         assert_eq!(info[0].gif_count, 1);
         let cover = info[0].cover.as_deref().unwrap_or("");
         assert!(cover.ends_with("cover.png"));
@@ -394,14 +710,10 @@ mod tests {
         assert!(root.join("柴犬日常/01.gif").is_file());
         assert!(root.join("柴犬日常/cover.png").is_file());
 
-        // 已存在时 install_package 应报错
         let err = install_package_in(root.clone(), "柴犬日常".to_string()).unwrap_err();
         assert!(err.contains("已下载"), "err={err}");
-
-        // 商店没有的报错
         assert!(install_package_in(root.clone(), "不存在包".to_string()).is_err());
 
-        // 删除
         delete_package_in(root.clone(), "柴犬日常".to_string()).unwrap();
         assert!(!root.join("柴犬日常").exists());
     }
@@ -413,26 +725,26 @@ mod tests {
         fs::create_dir_all(&pkg).unwrap();
         fs::write(pkg.join("a.png"), [137, 80, 78, 71]).unwrap();
         fs::write(pkg.join("b.gif"), [71, 73, 70, 56]).unwrap();
-        // 越界文件
         fs::write(root.join("evil.png"), b"x").unwrap();
 
-        // 越界文件 (root 之外)
         let outside_name = format!("emoji_outside_{}", std::process::id());
         let outside = std::env::temp_dir().join(&outside_name);
         fs::write(&outside, b"x").unwrap();
         let evasive = root.join("..").join(&outside_name);
-        // 直接 root 下的文件 (可控区) 允许
+
         let inside_png = pkg.join("a.png").to_string_lossy().to_string();
-        assert_eq!(read_sticker_in(root.clone(), inside_png.clone()).unwrap().starts_with("data:image/png;base64,"), true);
-        let inside_gif = pkg.join("b.gif").to_string_lossy().to_string();
-        assert_eq!(read_sticker_in(root.clone(), inside_gif).unwrap().starts_with("data:image/gif;base64,"), true);
+        assert_eq!(
+            read_file_safe(&root, &inside_png).unwrap().starts_with(&[137, 80, 78, 71]),
+            true
+        );
         // 非绝对路径 / 越界(含 .. 绕过)必须拒绝; root 内文件放行
-        assert!(read_sticker_in(root.clone(), "rel/path.png".into()).is_err());
-        assert!(read_sticker_in(root.clone(), evasive.to_string_lossy().to_string()).is_err());
+        assert!(read_file_safe(&root, "rel/path.png").is_err());
+        assert!(read_file_safe(&root, &evasive.to_string_lossy().to_string()).is_err());
+        let evil = root.join("evil.png").to_string_lossy().to_string();
+        assert!(read_file_safe(&root, &evil).is_ok());
         let _ = fs::remove_file(&outside);
     }
 
-    // 命令函数需要 AppHandle, 这里抽出纯逻辑部分做测试
     fn install_package_in(root: PathBuf, name: String) -> Result<(), String> {
         let n = valid_name(&name)?;
         let from = root.join(SHOP_DIR).join(&n);
@@ -455,25 +767,5 @@ mod tests {
         }
         fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
         Ok(())
-    }
-
-    fn read_sticker_in(root: PathBuf, path: String) -> Result<String, String> {
-        let p = PathBuf::from(&path);
-        let ok = p.is_absolute()
-            && std::fs::canonicalize(&root)
-                .map(|cr| std::fs::canonicalize(&p).map(|cp| cp.starts_with(&cr)).unwrap_or(false))
-                .unwrap_or(false);
-        if !ok {
-            return Err("非法的文件路径".into());
-        }
-        let bytes = fs::read(&p).map_err(|e| e.to_string())?;
-        let mime = match p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
-            Some("gif") => "image/gif",
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("webp") => "image/webp",
-            Some("bmp") => "image/bmp",
-            _ => "image/png",
-        };
-        Ok(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes)))
     }
 }

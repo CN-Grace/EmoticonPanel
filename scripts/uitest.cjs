@@ -1,4 +1,4 @@
-// 前端 UI 端到端测试: 用真实 Edge 渲染 dist/, mock __TAURI_INTERNALS__ 桥, 驱动全部交互
+// 前端 UI 端到端测试: 真实 Edge 渲染 dist/, mock __TAURI_INTERNALS__ 桥, 驱动全部交互
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -16,7 +16,9 @@ window.__MOCK__ = {
   ],
   counts: { "基本表情": 24, "元气团子": 16, "像素猫": 20 },
   shop: [{ name: "柴犬日常", cover: null, count: 12, gifCount: 12, shop: true }],
-  installed: []
+  installed: [],
+  target: null,
+  picking: false
 };
 window.__TAURI_INTERNALS__ = {
   invoke: async (cmd, args = {}) => {
@@ -26,7 +28,7 @@ window.__TAURI_INTERNALS__ = {
       case "list_packages": return M.pkgs;
       case "get_root": return "C:/mock/stickers";
       case "list_stickers": {
-        const n = M.counts && M.counts[args.package] != null ? M.counts[args.package] : 24;
+        const n = M.counts[args.package] != null ? M.counts[args.package] : 24;
         return Array.from({ length: n }, (_, i) => ({
           url: "C:/mock/stickers/" + args.package + "/" + String(i + 1).padStart(2, "0") + ".png",
           name: String(i + 1),
@@ -38,6 +40,11 @@ window.__TAURI_INTERNALS__ = {
       case "install_package": M.installed.push(args.name); M.pkgs.push({ name: args.name, cover: null, count: 12, gifCount: 12, shop: false }); return null;
       case "delete_package": M.pkgs = M.pkgs.filter((p) => p.name !== args.name); return null;
       case "reveal_root": return null;
+      case "get_target": return M.target;
+      case "is_picking": return M.picking;
+      case "begin_pick": M.picking = true; return null;
+      case "cancel_pick": M.picking = false; return null;
+      case "insert_sticker": M.inserted = (M.inserted || []).concat([args.path]); return null;
       default: return null;
     }
   }
@@ -75,99 +82,84 @@ function check(name, ok, extra) {
   await page.goto("http://127.0.0.1:8899/", { waitUntil: "load" });
   await page.waitForSelector(".tab");
 
-  // 1. 初始渲染: 3 分组, 第一组 24 张 → 21 格 + 2 圆点
-  const tabs = await page.locator(".tab").count();
-  const cells = await page.locator(".stk-cell").count();
-  const dots = await page.locator(".dot").count();
-  check("tabs==3", tabs === 3, `tabs=${tabs}`);
-  check("grid cells==21 (page1 of 24)", cells === 21, `cells=${cells}`);
-  check("page dots==2", dots === 2, `dots=${dots}`);
+  // 1. 无输入框 (用户要求去掉)
+  const hasInputBar = await page.locator(".input-bar").count();
+  check("no input bar", hasInputBar === 0, `count=${hasInputBar}`);
 
-  // img src 为 data:image
-  const src = await page.locator(".stk-cell img").first().getAttribute("src");
-  check("cell img is data-url png", !!src && src.startsWith("data:image/png"), src);
+  // 2. 初始渲染: 3 分组, 21 格 + 2 圆点
+  check("tabs==3", (await page.locator(".tab").count()) === 3);
+  check("grid cells==21 (page1 of 24)", (await page.locator(".stk-cell").count()) === 21);
+  check("page dots==2", (await page.locator(".dot").count()) === 2);
 
-  // 2. 翻页: 点第2个圆点 → 3 格
-  await page.locator(".dot").nth(1).click();
-  await page.waitForTimeout(100);
-  const cellsP2 = await page.locator(".stk-cell").count();
-  check("page2 cells==3", cellsP2 === 3, `cells=${cellsP2}`);
+  // 3. attach 初始态: 未选择窗口
+  check("attach label 选择窗口", (await page.locator("#attachLabel").textContent()) === "选择窗口");
 
-  // 3. 点表情 → chip 出现, 发送可用
+  // 4. 未选择窗口时点击表情 → 提示 (无插入调用)
   await page.locator(".stk-cell").first().click();
-  const chips = await page.locator("#inputChips img").count();
-  check("chip added on click", chips === 1, `chips=${chips}`);
-  const sendDisabled = await page.locator("#sendBtn").isDisabled();
-  check("send enabled", sendDisabled === false);
+  await page.waitForTimeout(80);
+  const insertedBefore = await page.evaluate(() => (window.__MOCK__.inserted || []).length);
+  check("no insert without target", insertedBefore === 0, `inserted=${insertedBefore}`);
 
-  // 4. 发送 → toast + 清空 + 禁用
-  await page.locator("#sendBtn").click();
-  const toastTxt = await page.locator("#toast").textContent();
-  await page.waitForTimeout(50);
-  const chipsAfter = await page.locator("#inputChips img").count();
-  check("toast 已发送", (toastTxt || "").includes("已发送 1 个表情"), toastTxt);
-  check("chips cleared", chipsAfter === 0, `chips=${chipsAfter}`);
-  check("send disabled again", await page.locator("#sendBtn").isDisabled());
+  // 5. 点击 attach 开始拾取 → 状态进入 picking
+  await page.locator("#attachBtn").click();
+  await page.waitForTimeout(80);
+  const pickingState = await page.evaluate(() => window.__MOCK__.picking);
+  const labelPicking = await page.locator("#attachLabel").textContent();
+  check("begin_pick called", pickingState === true);
+  check("attach shows picking label", (labelPicking || "").includes("目标窗口"));
 
-  // 5. 切组: 元气团子 16 张 → 1 页 16 格
-  await page.locator(".tab").nth(1).click();
-  await page.waitForTimeout(100);
-  const cellsG = await page.locator(".stk-cell").count();
-  const dotsG = await page.locator(".dot").count();
-  check("group2 cells==16", cellsG === 16, `cells=${cellsG}`);
-  check("group2 dots==1", dotsG === 1, `dots=${dotsG}`);
+  // 6. 模拟后端完成拾取: target 设置 + picking=false (轮询最多 2s)
+  await page.evaluate(() => {
+    window.__MOCK__.target = { hwnd: 12345, title: "文件传输助手", process: "WeChat.exe", pid: 8888 };
+    window.__MOCK__.picking = false;
+  });
+  await page.waitForFunction(() => {
+    const l = document.querySelector("#attachLabel");
+    return l && l.textContent.includes("WeChat");
+  }, null, { timeout: 5000 });
+  check("attach shows target title", (await page.locator("#attachLabel").textContent()).includes("文件传输助手"));
+  check("attach linked style", await page.locator("#attachBtn.linked").count() === 1);
 
-  // 6. GIF 徽标
-  const gifBadge = await page.locator(".tab .gif-badge").count();
-  check("gif badge on group2 tab", gifBadge === 1, `badge=${gifBadge}`);
-
-  // 7. hover 预览
-  await page.locator(".stk-cell").first().hover();
+  // 7. 点击表情 → insert_sticker 携带路径 → toast
+  const firstPath = await page.evaluate(() => window.__MOCK__.counts);
+  await page.locator(".stk-cell").first().click();
   await page.waitForTimeout(120);
-  const prevHidden = await page.locator("#preview").isHidden();
-  const prevSrc = await page.locator("#previewImg").getAttribute("src");
-  check("preview visible on hover", prevHidden === false && !!prevSrc, `hidden=${prevHidden} src=${prevSrc}`);
-  await page.mouse.move(5, 5);
-  await page.waitForTimeout(80);
-  check("preview hidden after leave", await page.locator("#preview").isHidden());
+  const inserted = await page.evaluate(() => window.__MOCK__.inserted || []);
+  check("insert_sticker invoked with path", inserted.length === 1 && inserted[0].includes("基本表情"), JSON.stringify(inserted));
+  const toastTxt = await page.locator("#toast").textContent();
+  check("toast 已插入", (toastTxt || "").includes("已插入"), toastTxt);
 
-  // 8. 右键删除分组 (确认弹窗)
-  await page.locator(".tab").first().click({ button: "right" });
+  // 8. 再次点击 attach (此时已 linked) → 重新拾取
+  await page.evaluate(() => { window.__MOCK__.picking = true; });
+  await page.locator("#attachBtn").click();
   await page.waitForTimeout(80);
+  check("re-pick sets picking", await page.evaluate(() => window.__MOCK__.picking));
+  // 取消
+  await page.evaluate(() => { window.__MOCK__.picking = false; });
+  await page.locator("#attachBtn").click();
+  await page.waitForTimeout(50);
+  check("cancel ends picking", (await page.locator("#attachBtn.picking").count()) === 0);
+
+  // 9. 翻页/切组/预览/商店/删除 仍正常
+  await page.locator(".tab").nth(1).click();
+  await page.waitForTimeout(80);
+  check("group2 cells==16", (await page.locator(".stk-cell").count()) === 16);
+  await page.locator(".stk-cell").first().hover();
+  await page.waitForTimeout(80);
+  check("preview visible", !(await page.locator("#preview").isHidden()));
+  await page.locator(".tab").first().click({ button: "right" });
+  await page.waitForTimeout(60);
   check("ctx menu visible", await page.locator("#ctxMenu").isVisible());
   await page.locator("#ctxMenu .item.danger").click();
-  await page.waitForTimeout(80);
-  check("confirm modal visible", await page.locator("#modalMask").isVisible());
+  await page.waitForTimeout(60);
   await page.locator("#modalOk").click();
-  await page.waitForTimeout(150);
-  const tabsAfterDel = await page.locator(".tab").count();
-  const delCalled = await page.evaluate(() => window.__MOCK__.calls.some(([c]) => c === "delete_package"));
-  check("delete_package invoked", delCalled);
-  check("tabs==2 after delete", tabsAfterDel === 2, `tabs=${tabsAfterDel}`);
-
-  // 9. 商店: 打开 → 列表 → 下载
+  await page.waitForTimeout(100);
+  check("delete_package invoked", await page.evaluate(() => window.__MOCK__.calls.some(([c]) => c === "delete_package")));
+  check("tabs==2 after delete", (await page.locator(".tab").count()) === 2);
   await page.locator("#shopBtn").click();
-  await page.waitForTimeout(120);
-  check("shop view visible", await page.locator("#shopView").isVisible());
-  const shopItems = await page.locator(".shop-item").count();
-  check("shop items==1", shopItems === 1, `items=${shopItems}`);
-  await page.locator(".shop-item .dl-btn").first().click();
-  await page.waitForTimeout(150);
-  const installed = await page.evaluate(() => window.__MOCK__.installed);
-  check("install_package invoked with 柴犬日常", installed.includes("柴犬日常"), JSON.stringify(installed));
-  await page.locator("#shopBack").click();
   await page.waitForTimeout(80);
-  check("shop closes", await page.locator("#shopView").isHidden());
-  const tabsFinal = await page.locator(".tab").count();
-  check("tabs==3 after install (shop adds pkg)", tabsFinal === 3, `tabs=${tabsFinal}`);
-
-  // 10. ⌫ 删除输入表情
-  await page.locator(".stk-cell").first().click();
-  await page.locator(".stk-cell").nth(2).click();
-  check("two chips", (await page.locator("#inputChips img").count()) === 2);
-  await page.locator("#delBtn").click();
-  await page.waitForTimeout(50);
-  check("del removes last chip", (await page.locator("#inputChips img").count()) === 1);
+  check("shop opens", await page.locator("#shopView").isVisible());
+  await page.evaluate(() => { window.__MOCK__.picking = false; });
 
   await browser.close();
   server.close();

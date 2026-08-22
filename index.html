@@ -10,28 +10,22 @@
 
   <body>
     <div id="app">
-      <!-- 顶部: 表情输入条 -->
-      <div class="input-bar">
-        <div class="input-box" id="inputBox">
-          <div class="chips" id="inputChips"></div>
-          <span class="ph" id="inputPh">点按表情添加到输入框，⌫ 可删除，发送后清空</span>
-        </div>
-      </div>
-
       <!-- 表情网格 + 翻页圆点 -->
       <div class="grid-wrap">
         <div class="grid-area" id="gridArea"></div>
         <div class="page-dots" id="pageDots"></div>
       </div>
 
-      <!-- 底部栏: 分组 Tab + 操作 + 发送 -->
+      <!-- 底部栏: 分组 Tab + 商店 + 刷新 + attach 目标窗口 -->
       <div class="bottom-bar">
         <div class="tabs" id="tabs"></div>
         <button class="icon-btn shop-entry" id="shopBtn" title="表情商店">＋</button>
         <button class="icon-btn" id="refreshBtn" title="刷新表情包">⭮</button>
         <span class="tabs-spacer"></span>
-        <button class="icon-btn del-btn" id="delBtn" title="删除一个">⌫</button>
-        <button class="send-btn" id="sendBtn" disabled>发送</button>
+        <button class="attach-btn" id="attachBtn" title="点击选择要插入表情的目标窗口">
+          <span class="attach-ico">📌</span>
+          <span class="attach-label" id="attachLabel">选择窗口</span>
+        </button>
       </div>
 
       <!-- 悬浮大预览 -->

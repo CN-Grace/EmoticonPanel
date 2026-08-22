@@ -14,6 +14,13 @@ interface PackageInfo {
   shop: boolean;
 }
 
+interface TargetInfo {
+  hwnd: number;
+  title: string;
+  process: string;
+  pid: number;
+}
+
 const PAGE_W = 7;
 const PAGE_H = 3;
 const PAGE_SIZE = PAGE_W * PAGE_H;
@@ -24,8 +31,9 @@ const state = {
   current: 0,
   page: 0,
   cache: new Map<string, string>(),
-  chips: [] as { path: string; name: string }[],
   root: "",
+  target: null as TargetInfo | null,
+  picking: false,
 };
 
 const $ = <T extends HTMLElement>(sel: string) =>
@@ -34,10 +42,6 @@ const $ = <T extends HTMLElement>(sel: string) =>
 const gridArea = $("#gridArea");
 const pageDots = $("#pageDots");
 const tabsEl = $("#tabs");
-const chipsEl = $("#inputChips");
-const inputPh = $("#inputPh");
-const sendBtn = document.querySelector("#sendBtn") as HTMLButtonElement;
-const delBtn = $("#delBtn");
 const preview = $("#preview");
 const previewImg = document.querySelector("#previewImg") as HTMLImageElement;
 const ctxMenu = $("#ctxMenu");
@@ -47,6 +51,8 @@ const shopHint = $("#shopHint");
 const modalMask = $("#modalMask");
 const modalText = $("#modalText");
 const toast = $("#toast");
+const attachBtn = $("#attachBtn");
+const attachLabel = $("#attachLabel");
 
 // ---------- 基础工具 ----------
 let toastTimer: number | undefined;
@@ -109,7 +115,7 @@ async function loadAll() {
     renderGrid();
     renderDots();
   }
-  updateSend();
+  refreshTarget();
 }
 
 function renderTabs() {
@@ -173,7 +179,7 @@ function renderGrid() {
       .then((d) => (img.src = d))
       .catch(() => {});
     cell.appendChild(img);
-    cell.addEventListener("click", () => addChip(st.url, st.name));
+    cell.addEventListener("click", () => insertSticker(st));
     cell.addEventListener("pointerenter", (e) =>
       showPreview(e.clientX, e.clientY, st.url)
     );
@@ -200,7 +206,6 @@ function renderDots() {
   }
 }
 
-// 滚轮翻页
 gridArea.addEventListener(
   "wheel",
   (e) => {
@@ -218,10 +223,9 @@ gridArea.addEventListener(
 
 // ---------- 预览 ----------
 function showPreview(x: number, y: number, path: string) {
-  const img = previewImg;
   preview.hidden = false;
   loadImage(path).then((d) => {
-    if (!preview.hidden) img.src = d;
+    if (!preview.hidden) previewImg.src = d;
   });
   movePreview(x, y);
 }
@@ -241,46 +245,84 @@ function hidePreview() {
   previewImg.removeAttribute("src");
 }
 
-// ---------- 输入框 / 发送 / 删除 ----------
-function addChip(path: string, name: string) {
-  state.chips.push({ path, name });
-  renderChips();
-}
-
-function renderChips() {
-  chipsEl.innerHTML = "";
-  inputPh.style.display = state.chips.length ? "none" : "";
-  for (const c of state.chips) {
-    const img = document.createElement("img");
-    img.title = c.name;
-    img.alt = c.name;
-    loadImage(c.path).then((d) => (img.src = d));
-    img.addEventListener("click", () => {
-      state.chips = state.chips.filter((x) => x !== c);
-      renderChips();
-    });
-    chipsEl.appendChild(img);
+// ---------- attach 目标窗口 + 插入 ----------
+async function refreshTarget() {
+  try {
+    const [target, picking] = await Promise.all([
+      invoke<TargetInfo | null>("get_target"),
+      invoke<boolean>("is_picking"),
+    ]);
+    state.target = target;
+    state.picking = picking;
+    renderAttach();
+  } catch {
+    /* ignore */
   }
-  updateSend();
 }
 
-function updateSend() {
-  sendBtn.disabled = state.chips.length === 0;
+function renderAttach() {
+  attachBtn.classList.toggle("linked", !!state.target && !state.picking);
+  attachBtn.classList.toggle("picking", state.picking);
+  if (state.picking) {
+    attachLabel.textContent = "点击目标窗口… 取消";
+    attachBtn.title = "正在拾取 (再次点击取消)";
+  } else if (state.target) {
+    const t = state.target;
+    attachLabel.textContent = `${t.process} · ${ellipsis(t.title, 10)}`;
+    attachBtn.title = `目标: ${t.title} — 点击重新选择`;
+  } else {
+    attachLabel.textContent = "选择窗口";
+    attachBtn.title = "点击选择要插入表情的目标窗口";
+  }
 }
 
-sendBtn.addEventListener("click", async () => {
-  const n = state.chips.length;
-  if (!n) return;
-  state.chips = [];
-  renderChips();
-  showToast(`已发送 ${n} 个表情 ✓`);
+attachBtn.addEventListener("click", async () => {
+  if (state.picking) {
+    await invoke("cancel_pick");
+    state.picking = false;
+    renderAttach();
+    return;
+  }
+  try {
+    await invoke("begin_pick");
+    state.picking = true;
+    renderAttach();
+    showToast("请在 15 秒内点击目标窗口");
+    // 轮询拾取结果
+    const t0 = Date.now();
+    const timer = window.setInterval(async () => {
+      const picking = await invoke<boolean>("is_picking");
+      state.picking = picking;
+      const target = await invoke<TargetInfo | null>("get_target");
+      state.target = target;
+      renderAttach();
+      if (!picking || Date.now() - t0 > 16000) {
+        window.clearInterval(timer);
+        if (target) showToast(`已绑定: ${target.process} · ${target.title}`);
+        else if (!picking) showToast("未选择目标窗口");
+      }
+    }, 400);
+  } catch (err) {
+    showToast(String(err));
+  }
 });
 
-delBtn.addEventListener("click", () => {
-  if (!state.chips.length) return;
-  state.chips.pop();
-  renderChips();
-});
+async function insertSticker(st: StickerInfo) {
+  if (state.picking) {
+    showToast("先完成目标窗口选择");
+    return;
+  }
+  if (!state.target) {
+    showToast("请先点击右下角「选择窗口」绑定目标");
+    return;
+  }
+  try {
+    await invoke("insert_sticker", { path: st.url });
+    showToast(`已插入 → ${state.target.process}`);
+  } catch (err) {
+    showToast(String(err));
+  }
+}
 
 // ---------- 刷新 ----------
 $("#refreshBtn").addEventListener("click", () => {
@@ -326,8 +368,8 @@ async function openShop() {
     invoke<string>("get_root"),
   ]);
   shopHint.innerHTML =
-    `已安装分组点右侧 ⌫ ... 自定义表情包:把文件夹放入\n<code>${ellipsis(root, 34)}</code>\n然后点面板上的 ⭮ 刷新即可(支持 gif / png)` +
-    `<div class="shop-hint-open"><button id="openRoot">打开文件夹</button></div>`;
+    `点「下载」把商店表情包装进分组; 自定义表情包:把文件夹放入\n<code>${ellipsis(root, 34)}</code>\n然后点面板上的 ⭮ 刷新即可(支持 gif / png)` +
+    `<div class="open-root"><button id="openRoot">打开文件夹</button></div>`;
   shopView.hidden = false;
 
   $("#openRoot")?.addEventListener("click", async () => {
@@ -365,7 +407,7 @@ async function openShop() {
     desc.textContent = `${p.count} 个表情${p.gifCount ? ` · ${p.gifCount} 个动图` : ""} · 点击下载后出现在底部分组`;
     meta.append(name, desc);
 
-    const btn = document.createElement("button") as HTMLButtonElement;
+    const btn = document.createElement("button");
     const isInstalled = installed.has(p.name);
     btn.className = "dl-btn" + (isInstalled ? " done" : "");
     btn.textContent = isInstalled ? "已下载" : "下载";
