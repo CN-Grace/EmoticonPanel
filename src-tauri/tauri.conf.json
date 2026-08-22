@@ -14,10 +14,10 @@
     "windows": [
       {
         "title": "表情面板",
-        "width": 400,
-        "height": 560,
-        "minWidth": 360,
-        "minHeight": 480,
+        "width": 300,
+        "height": 340,
+        "minWidth": 260,
+        "minHeight": 300,
         "resizable": true,
         "center": true
       }

@@ -21,15 +21,10 @@ interface TargetInfo {
   pid: number;
 }
 
-const PAGE_W = 7;
-const PAGE_H = 3;
-const PAGE_SIZE = PAGE_W * PAGE_H;
-
 const state = {
   packages: [] as PackageInfo[],
   stickers: [] as StickerInfo[],
   current: 0,
-  page: 0,
   cache: new Map<string, string>(),
   root: "",
   target: null as TargetInfo | null,
@@ -40,7 +35,7 @@ const $ = <T extends HTMLElement>(sel: string) =>
   document.querySelector(sel) as T;
 
 const gridArea = $("#gridArea");
-const pageDots = $("#pageDots");
+const groupNameEl = $("#groupName");
 const tabsEl = $("#tabs");
 const preview = $("#preview");
 const previewImg = document.querySelector("#previewImg") as HTMLImageElement;
@@ -108,12 +103,11 @@ async function loadAll() {
   renderTabs();
   if (state.current >= pkgs.length) state.current = 0;
   if (pkgs.length) {
-    state.page = 0;
     await selectGroup(state.current);
   } else {
     state.stickers = [];
     renderGrid();
-    renderDots();
+    groupNameEl.textContent = "还没有表情包";
   }
   refreshTarget();
 }
@@ -147,7 +141,6 @@ function renderTabs() {
 
 async function selectGroup(i: number) {
   state.current = i;
-  state.page = 0;
   const p = state.packages[i];
   if (!p) return;
   state.stickers = await invoke<StickerInfo[]>("list_stickers", {
@@ -156,19 +149,14 @@ async function selectGroup(i: number) {
   tabsEl.querySelectorAll(".tab").forEach((t, idx) =>
     t.classList.toggle("active", idx === i)
   );
+  groupNameEl.textContent = `${p.name} · ${p.count} 个${p.gifCount ? ` (${p.gifCount} 个动图)` : ""}`;
+  gridArea.scrollTop = 0;
   renderGrid();
-  renderDots();
-}
-
-function pageCount() {
-  return Math.max(1, Math.ceil(state.stickers.length / PAGE_SIZE));
 }
 
 function renderGrid() {
   gridArea.innerHTML = "";
-  const start = state.page * PAGE_SIZE;
-  const slice = state.stickers.slice(start, start + PAGE_SIZE);
-  for (const st of slice) {
+  for (const st of state.stickers) {
     const cell = document.createElement("div");
     cell.className = "stk-cell";
     cell.dataset.path = st.url;
@@ -190,36 +178,6 @@ function renderGrid() {
     gridArea.appendChild(cell);
   }
 }
-
-function renderDots() {
-  pageDots.innerHTML = "";
-  const n = pageCount();
-  for (let i = 0; i < n; i++) {
-    const dot = document.createElement("div");
-    dot.className = "dot" + (i === state.page ? " active" : "");
-    dot.addEventListener("click", () => {
-      state.page = i;
-      renderGrid();
-      renderDots();
-    });
-    pageDots.appendChild(dot);
-  }
-}
-
-gridArea.addEventListener(
-  "wheel",
-  (e) => {
-    e.preventDefault();
-    const n = pageCount();
-    const target = e.deltaY > 0 ? state.page + 1 : state.page - 1;
-    if (target >= 0 && target < n) {
-      state.page = target;
-      renderGrid();
-      renderDots();
-    }
-  },
-  { passive: false }
-);
 
 // ---------- 预览 ----------
 function showPreview(x: number, y: number, path: string) {

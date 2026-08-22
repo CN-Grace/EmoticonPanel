@@ -76,7 +76,7 @@ function check(name, ok, extra) {
   await new Promise((r) => server.listen(8899, r));
   const { chromium } = require("D:/dev/playwright-mcp/node_modules/playwright");
   const browser = await chromium.launch({ channel: "msedge", headless: true });
-  const page = await browser.newPage({ viewport: { width: 400, height: 560 } });
+  const page = await browser.newPage({ viewport: { width: 300, height: 340 } });
   page.on("pageerror", (e) => console.log("PAGEERROR:", e.message));
 
   await page.goto("http://127.0.0.1:8899/", { waitUntil: "load" });
@@ -86,10 +86,16 @@ function check(name, ok, extra) {
   const hasInputBar = await page.locator(".input-bar").count();
   check("no input bar", hasInputBar === 0, `count=${hasInputBar}`);
 
-  // 2. 初始渲染: 3 分组, 21 格 + 2 圆点
+  // 2. 初始渲染: 3 分组; 4 列网格显示全部 24 张 (不分页); 表情包名
   check("tabs==3", (await page.locator(".tab").count()) === 3);
-  check("grid cells==21 (page1 of 24)", (await page.locator(".stk-cell").count()) === 21);
-  check("page dots==2", (await page.locator(".dot").count()) === 2);
+  check("grid cells==24 (all, no pagination)", (await page.locator(".stk-cell").count()) === 24);
+  check("no page dots", (await page.locator(".page-dots").count()) === 0);
+  check("group name shown", (await page.locator("#groupName").textContent()) === "基本表情 · 24 个");
+  const imgRect = await page.locator(".stk-cell img").first().evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return { w: r.width, h: r.height };
+  });
+  check("cell img 50x50", imgRect.w === 50 && imgRect.h === 50, JSON.stringify(imgRect));
 
   // 3. attach 初始态: 未选择窗口
   check("attach label 选择窗口", (await page.locator("#attachLabel").textContent()) === "选择窗口");
@@ -140,10 +146,18 @@ function check(name, ok, extra) {
   await page.waitForTimeout(50);
   check("cancel ends picking", (await page.locator("#attachBtn.picking").count()) === 0);
 
-  // 9. 翻页/切组/预览/商店/删除 仍正常
+  // 9. 网格可滚动 (24 个 → 6 行, 内容高于可视区)
+  const scrollInfo = await page.locator("#gridArea").evaluate((el) => ({
+    client: el.clientHeight,
+    scroll: el.scrollHeight,
+  }));
+  check("grid scrollable", scrollInfo.scroll > scrollInfo.client, JSON.stringify(scrollInfo));
+
+  // 10. 切组/预览/商店/删除 仍正常
   await page.locator(".tab").nth(1).click();
   await page.waitForTimeout(80);
   check("group2 cells==16", (await page.locator(".stk-cell").count()) === 16);
+  check("group2 name shown", (await page.locator("#groupName").textContent()) === "元气团子 · 16 个 (16 个动图)");
   await page.locator(".stk-cell").first().hover();
   await page.waitForTimeout(80);
   check("preview visible", !(await page.locator("#preview").isHidden()));
