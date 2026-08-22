@@ -421,16 +421,17 @@ impl eframe::App for App {
                     let per = 36.0;
                     let total_w = names.len() as f32 * per - 4.0;
                     let max_off = (total_w - avail_w).max(0.0);
-                    if max_off > 0.0 {
+                    let (row_rect, row_resp) = ui.allocate_exact_size(vec2(avail_w, 32.0), Sense::hover());
+                    // 只有鼠标悬停在 Tab 栏上时才响应滚轮 (避免全局误滚)
+                    if max_off > 0.0 && row_resp.hovered() {
                         let dy = ui.input(|i| i.raw_scroll_delta.y);
                         if dy != 0.0 {
                             // 滚轮向上 -> 向左滚动
                             self.tabs_off = (self.tabs_off - dy).clamp(0.0, max_off);
                         }
-                    } else {
+                    } else if max_off <= 0.0 {
                         self.tabs_off = 0.0;
                     }
-                    let (row_rect, row_resp) = ui.allocate_exact_size(vec2(avail_w, 32.0), Sense::hover());
                     let painter = ui.painter_at(row_rect);
                     let mut clicked = None;
                     let mut right_clicked = None;
