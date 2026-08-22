@@ -6,7 +6,7 @@ mod core;
 use core::{Attach, Sticker};
 use egui::{
     pos2, vec2, Align, Align2, Color32, FontId, Frame, Id, Layout, Margin, Pos2, Rect, RichText,
-    Rounding, Sense, Stroke, TextureHandle, TextureOptions, Vec2, epaint::TextureId,
+    Rounding, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -53,7 +53,7 @@ fn trunc(s: &str, n: usize) -> String {
     out
 }
 
-fn decode_frames(bytes: &[u8], ctx: &egui::Context, max: u32, tag: &str) -> Option<(Vec<TextureHandle>, Vec<u64>)> {
+fn decode_frames(bytes: &[u8], max: u32) -> Option<(Vec<egui::ColorImage>, Vec<u64>)> {
     let fmt = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?.format()?;
     let mut frames: Vec<egui::ColorImage> = Vec::new();
     let mut delays: Vec<u64> = Vec::new();
@@ -87,12 +87,7 @@ fn decode_frames(bytes: &[u8], ctx: &egui::Context, max: u32, tag: &str) -> Opti
     if frames.is_empty() {
         return None;
     }
-    let handles = frames
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| ctx.load_texture(format!("{tag}#{i}"), c, TextureOptions::LINEAR))
-        .collect();
-    Some((handles, delays))
+    Some((frames, delays))
 }
 
 struct Avatar {
@@ -117,8 +112,9 @@ struct App {
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     // 后台解码: 固定 worker 池 (MPMC)
     job_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
-    done_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<TextureHandle>, Vec<u64>)>,
-    done_tx: std::sync::mpsc::Sender<(PathBuf, Vec<TextureHandle>, Vec<u64>)>,
+    done_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
+    done_tx: std::sync::mpsc::Sender<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
+    tex_seq: u64,
     tabs_off: f32,
     tab_hover_last: Option<usize>,
     first_paths: Vec<PathBuf>,
@@ -142,9 +138,10 @@ impl App {
             let ctx = cc.egui_ctx.clone();
             let tx = done_tx.clone();
             std::thread::spawn(move || {
+                let _ = ctx;
                 while let Ok((path, bytes)) = rx.recv() {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        decode_frames(&bytes, &ctx, THUMB_MAX, &path.to_string_lossy())
+                        decode_frames(&bytes, THUMB_MAX)
                     }));
                     let (frames, delays) = match res {
                         Ok(Some((f, d))) => (f, d),
@@ -170,6 +167,7 @@ impl App {
             job_tx,
             done_rx,
             done_tx,
+            tex_seq: 0,
             tabs_off: 0.0,
             tab_hover_last: None,
             first_paths: Vec::new(),
@@ -210,17 +208,23 @@ impl App {
         self.rebuild_tab_covers(ctx);
     }
 
-    /// 每帧: 收 worker 完成结果
+    /// 每帧: 收 worker 完成结果, 主线程创建纹理
     fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
-        while let Ok((path, frames, delays)) = self.done_rx.try_recv() {
+        while let Ok((path, colors, delays)) = self.done_rx.try_recv() {
             got += 1;
-            if !frames.is_empty() {
+            if !colors.is_empty() {
+                // 主线程逐帧建纹理
+                let mut frames = Vec::with_capacity(colors.len());
+                for (i, c) in colors.iter().enumerate() {
+                    self.tex_seq += 1;
+                    frames.push(ctx.load_texture(format!("t{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
+                }
+                let cover_tex = frames[0].clone();
                 if let Some(i) = self.first_paths.iter().position(|f| *f == path) {
-                    if let Some(cover) = &self.tab_cover[i] {
-                        if cover.id() == self.fallback.id() {
-                            self.tab_cover[i] = Some(frames[0].clone());
-                        }
+                    let replacing = self.tab_cover[i].as_ref().map(|h| h.id() == self.fallback.id()).unwrap_or(false);
+                    if replacing {
+                        self.tab_cover[i] = Some(cover_tex);
                     }
                 }
                 self.thumbs.insert(path.clone(), Avatar { frames, delays, current: 0, last_time: 0.0 });
@@ -292,9 +296,14 @@ impl App {
     fn ensure_thumb(&mut self, ctx: &egui::Context, path: &std::path::Path) {
         if !self.thumbs.contains_key(path) {
             if let Ok(bytes) = std::fs::read(path) {
-                let tag = path.to_string_lossy().to_string();
-                if let Some((frames, delays)) = decode_frames(&bytes, ctx, THUMB_MAX, &tag) {
+                if let Some((colors, delays)) = decode_frames(&bytes, THUMB_MAX) {
+                    let mut frames = Vec::with_capacity(colors.len());
+                    for (i, c) in colors.iter().enumerate() {
+                        self.tex_seq += 1;
+                        frames.push(ctx.load_texture(format!("t{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
+                    }
                     self.thumbs.insert(path.to_path_buf(), Avatar { frames, delays, current: 0, last_time: 0.0 });
+                    self.thumb_order.push_back(path.to_path_buf());
                 }
             }
         }
@@ -784,4 +793,31 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native("表情面板", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn decode_smoke() {
+        let ctx = egui::Context::default();
+        let base = std::env::var("APPDATA").unwrap();
+        let root = std::path::Path::new(&base).join("EmoticonPanel-egui").join("stickers");
+        let mut found = 0;
+        for rd in std::fs::read_dir(&root).unwrap() {
+            let dir = rd.unwrap().path();
+            if !dir.is_dir() { continue; }
+            let ss = core::list_stickers(&root, dir.file_name().unwrap().to_str().unwrap()).unwrap();
+            for st in ss.iter().take(1) {
+                let bytes = std::fs::read(&st.path).unwrap();
+                let _ = &ctx;
+                let r = decode_frames(&bytes, THUMB_MAX);
+                assert!(r.is_some(), "decode failed for {}", st.path.display());
+                let (frames, _) = r.unwrap();
+                assert!(!frames.is_empty());
+                found += 1;
+                eprintln!("OK decode {} -> {} frames", st.path.file_name().unwrap().to_string_lossy(), frames.len());
+            }
+        }
+        assert!(found >= 1, "no stickers found?");
+    }
 }
