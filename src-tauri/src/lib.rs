@@ -94,10 +94,42 @@ fn set_stickers_dir(app: tauri::AppHandle, path: String) -> Result<String, Strin
     if let Some(parent) = file.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let v = serde_json::json!({ "stickersDir": p.to_string_lossy() });
-    fs::write(&file, serde_json::to_string_pretty(&v).unwrap_or_default())
-        .map_err(|e| format!("保存配置失败: {e}"))?;
+    let mut v = read_settings(&app);
+    v["stickersDir"] = serde_json::json!(p.to_string_lossy());
+    write_settings(&app, &v)?;
     Ok(p.to_string_lossy().to_string())
+}
+
+fn read_settings(app: &tauri::AppHandle) -> serde_json::Value {
+    std::fs::read_to_string(settings_file(app))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_settings(app: &tauri::AppHandle, v: &serde_json::Value) -> Result<(), String> {
+    let file = settings_file(app);
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&file, serde_json::to_string_pretty(v).unwrap_or_default())
+        .map_err(|e| format!("保存配置失败: {e}"))
+}
+
+/// 始终置顶 状态
+#[tauri::command]
+fn get_always_on_top(app: tauri::AppHandle) -> bool {
+    read_settings(&app)
+        .get("alwaysOnTop")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_always_on_top(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    let mut v = read_settings(&app);
+    v["alwaysOnTop"] = serde_json::json!(on);
+    write_settings(&app, &v)
 }
 
 fn valid_name(name: &str) -> Result<String, String> {
@@ -740,6 +772,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_root,
             set_stickers_dir,
+            get_always_on_top,
+            set_always_on_top,
             list_packages,
             list_stickers,
             read_sticker,

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 interface StickerInfo {
@@ -45,6 +46,8 @@ const modalText = $("#modalText");
 const toast = $("#toast");
 const settings = $("#settings");
 const setLocationVal = $("#setLocationVal");
+const setAotVal = $("#setAotVal");
+const setAotBtn = $("#setAotBtn");
 
 // ---------- 基础工具 ----------
 let toastTimer: number | undefined;
@@ -300,6 +303,35 @@ $("#setRefreshBtn").addEventListener("click", () => {
   loadAll().then(() => showToast("已刷新表情包"));
 });
 
+// 始终置顶: 读取持久化状态并切换
+let aot = false;
+async function initAot() {
+  try {
+    aot = await invoke<boolean>("get_always_on_top");
+  } catch {
+    aot = false;
+  }
+  setAotVal.textContent = aot ? "开启" : "关闭";
+  setAotBtn.textContent = aot ? "已开启" : "开启";
+  if (aot) {
+    try {
+      await getCurrentWindow().setAlwaysOnTop(true);
+    } catch { /* 忽略 */ }
+  }
+}
+$("#setAotBtn").addEventListener("click", async () => {
+  aot = !aot;
+  setAotVal.textContent = aot ? "开启" : "关闭";
+  setAotBtn.textContent = aot ? "已开启" : "开启";
+  try {
+    await getCurrentWindow().setAlwaysOnTop(aot);
+    await invoke("set_always_on_top", { on: aot });
+    showToast(aot ? "已开启置顶" : "已关闭置顶");
+  } catch (e) {
+    showToast("置顶设置失败: " + e);
+  }
+});
+
 // 表情包位置: 选择文件夹并持久化
 $("#setLocationBtn").addEventListener("click", async () => {
   try {
@@ -368,3 +400,4 @@ function showCtxMenu(x: number, y: number, idx: number) {
 window.addEventListener("DOMContentLoaded", () => {
   loadAll();
 });
+initAot();
