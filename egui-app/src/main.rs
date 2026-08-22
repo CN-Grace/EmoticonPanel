@@ -64,8 +64,8 @@ fn decode_frames(bytes: &[u8], max: u32) -> Option<(Vec<egui::ColorImage>, Vec<u
         while frames.len() < 48 {
             match it.next() {
                 Some(Ok(frame)) => {
-                    let (n, d) = frame.delay().numer_denom_ms();
-                    delays.push(if d == 0 { 100 } else { ((n as f64 / d as f64) * 1000.0).max(20.0) as u64 });
+                    let (n, d) = frame.delay().numer_denom_ms(); // 已为毫秒有理对 (n/d = ms)
+                    delays.push(if d == 0 { 100 } else { (n as f64 / d as f64).max(20.0) as u64 });
                     let buf = frame.into_buffer();
                     let (nw, nh) = fit_dim(buf.width(), buf.height(), max);
                     let small = image::imageops::resize(&buf, nw, nh, image::imageops::FilterType::Triangle);
@@ -92,9 +92,10 @@ fn decode_frames(bytes: &[u8], max: u32) -> Option<(Vec<egui::ColorImage>, Vec<u
 
 struct Avatar {
     frames: Vec<TextureHandle>,
-    delays: Vec<u64>,
+    delays: Vec<u64>, // 每帧毫秒
     current: usize,
     last_time: f64,
+    elapsed_ms: u64, // Gif 已播放毫秒 (跨帧累积)
 }
 
 struct App {
@@ -172,7 +173,7 @@ impl App {
             tab_hover_last: None,
             first_paths: Vec::new(),
             thumb_order: std::collections::VecDeque::new(),
-        };
+                                                };
         a.load_group(&cc.egui_ctx);
         a
     }
@@ -227,7 +228,7 @@ impl App {
                         self.tab_cover[i] = Some(cover_tex);
                     }
                 }
-                self.thumbs.insert(path.clone(), Avatar { frames, delays, current: 0, last_time: 0.0 });
+                self.thumbs.insert(path.clone(), Avatar { frames, delays, current: 0, last_time: 0.0, elapsed_ms: 0 });
                 self.thumb_order.push_back(path);
             }
         }
@@ -302,7 +303,7 @@ impl App {
                         self.tex_seq += 1;
                         frames.push(ctx.load_texture(format!("t{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
                     }
-                    self.thumbs.insert(path.to_path_buf(), Avatar { frames, delays, current: 0, last_time: 0.0 });
+                    self.thumbs.insert(path.to_path_buf(), Avatar { frames, delays, current: 0, last_time: 0.0, elapsed_ms: 0 });
                     self.thumb_order.push_back(path.to_path_buf());
                 }
             }
@@ -317,15 +318,15 @@ impl App {
         for p in paths {
             if let Some(at) = self.thumbs.get_mut(&p) {
                 if at.delays.len() > 1 {
-                    let dt_ms = ((now - at.last_time) * 1000.0).max(0.0);
-                    let mut acc = dt_ms as u64;
+                    let dt_ms = ((now - at.last_time) * 1000.0).max(0.0) as u64;
+                    at.last_time = now;
+                    at.elapsed_ms += dt_ms;
                     let mut guard = 0usize;
-                    while acc >= at.delays[at.current] && guard < at.delays.len() {
-                        acc -= at.delays[at.current];
+                    while at.elapsed_ms >= at.delays[at.current] && guard < at.delays.len() {
+                        at.elapsed_ms -= at.delays[at.current];
                         at.current = (at.current + 1) % at.delays.len();
                         guard += 1;
                     }
-                    at.last_time = now;
                     min_delay = min_delay.min(at.delays[at.current].max(1));
                     need = true;
                 } else {
