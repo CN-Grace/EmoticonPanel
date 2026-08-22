@@ -253,9 +253,9 @@ impl App {
     }
 
     fn rebuild_tab_covers(&mut self, ctx: &egui::Context) {
-        self.tab_cover.clear();
         self.first_paths.clear();
-        let mut old: Vec<Option<TextureHandle>> = std::mem::take(&mut self.tab_cover);
+        // 先 take 旧封面 (绝不能先 clear), 否则 keep 丢失 -> 切组后封面全消失
+        let old: Vec<Option<TextureHandle>> = std::mem::take(&mut self.tab_cover);
         for (idx, p) in self.packages.iter().enumerate() {
             if let Ok(ss) = core::list_stickers(&self.root, &p.name) {
                 self.first_paths.push(ss.first().map(|f| f.path.clone()).unwrap_or_default());
