@@ -15,9 +15,9 @@
       {
         "title": "表情面板",
         "width": 350,
-        "height": 400,
+        "height": 470,
         "minWidth": 300,
-        "minHeight": 330,
+        "minHeight": 450,
         "resizable": true,
         "center": true
       }

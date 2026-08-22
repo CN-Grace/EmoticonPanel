@@ -83,7 +83,7 @@ function check(name, ok, extra) {
   await new Promise((r) => server.listen(8899, r));
   const { chromium } = require("D:/dev/playwright-mcp/node_modules/playwright");
   const browser = await chromium.launch({ channel: "msedge", headless: true });
-  const page = await browser.newPage({ viewport: { width: 350, height: 400 } });
+  const page = await browser.newPage({ viewport: { width: 350, height: 470 } });
   page.on("pageerror", (e) => console.log("PAGEERROR:", e.message));
 
   await page.goto("http://127.0.0.1:8899/", { waitUntil: "load" });
@@ -162,7 +162,7 @@ function check(name, ok, extra) {
   // 重开面板 → 点空白处关闭 → 点表情成功插入
   await page.locator("#gearBtn").click();
   await page.waitForTimeout(50);
-  await page.mouse.click(150, 372);
+  await page.mouse.click(150, 445);
   await page.waitForTimeout(50);
   const settingsHidden = await page.locator("#settings").isHidden();
   check("settings closes on outside click", settingsHidden);
