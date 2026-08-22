@@ -23,3 +23,4 @@ dist-ssr
 *.sln
 *.sw?
 scripts/wintest/target
+egui-app/target
