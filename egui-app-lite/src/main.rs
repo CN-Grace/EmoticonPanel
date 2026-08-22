@@ -244,10 +244,16 @@ impl App {
                         self.tex_seq += 1;
                         let tex = ctx.load_texture(format!("s{}", self.tex_seq), first.clone(), TextureOptions::LINEAR);
                         if let Some(av) = self.thumbs.get_mut(&path) {
-                            av.static_tex = tex;
+                            av.static_tex = tex.clone();
                         } else {
-                            self.thumbs.insert(path.clone(), Avatar { static_tex: tex, anim: None });
-                            self.thumb_order.push_back(path);
+                            self.thumbs.insert(path.clone(), Avatar { static_tex: tex.clone(), anim: None });
+                            self.thumb_order.push_back(path.clone());
+                        }
+                        // 首帧就绪 -> 更新对应 tab 封面
+                        if let Some(i) = self.first_paths.iter().position(|f| *f == path) {
+                            if self.tab_cover[i].as_ref().map(|h| h.id() == self.fallback.id()).unwrap_or(false) {
+                                self.tab_cover[i] = Some(tex);
+                            }
                         }
                     }
                 }
