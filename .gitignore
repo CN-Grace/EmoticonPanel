@@ -24,3 +24,5 @@ dist-ssr
 *.sw?
 scripts/wintest/target
 egui-app/target
+
+egui-app-lite/target
