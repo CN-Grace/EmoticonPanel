@@ -14,9 +14,9 @@ npm run tauri build -- --no-bundle   # 正式构建 → src-tauri/target/release
 3. 再点 attach 按钮可随时换目标;拾取中再点一次可取消
 
 > 粘贴方式(剪贴板多种格式并存):
-- **`PNG`/`image/png` 注册格式 ← 原始文件字节**:PNG 保留透明;GIF 微信等按实际字节(GIF 头)解码为**动图**
-- **CF_DIB 兜底位图**:BGRA 字节序 + 透明区域合成白底,避免黑底/变色
-- GIF 额外附 `FileGroupDescriptorW`/`FileContents`(资源管理器"复制文件"格式)
+- **CF_HDROP 真实文件路径(首选)**:微信/QQ"复制图片文件+Ctrl+V"会插入**原始文件** → 透明 PNG 与动图 GIF 全保留
+- **FileGroupDescriptorW + FileContents** 虚拟文件(同上语义,兼容虚拟剪贴板)
+- **`PNG`/`image/png` 原始字节 + CF_DIB(BGRA+白底合成)** 兜底给只认位图的程序
 
 ## 表情包目录
 

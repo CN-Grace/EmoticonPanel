@@ -390,7 +390,7 @@ mod win {
             let _ = keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY, 0);
             let _ = keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
             if IsIconic(hwnd).as_bool() {
-                ShowWindow(hwnd, SW_RESTORE);
+                let _ = ShowWindow(hwnd, SW_RESTORE).as_bool();
             }
             let _ = SetForegroundWindow(hwnd).as_bool();
         }
@@ -409,6 +409,44 @@ mod win {
     pub unsafe fn set_png_formats(bytes: &[u8]) -> Result<(), String> {
         set_data(RegisterClipboardFormatW(windows::core::w!("PNG")), bytes)?;
         set_data(RegisterClipboardFormatW(windows::core::w!("image/png")), bytes)?;
+        Ok(())
+    }
+
+    /// CF_HDROP(真实文件路径, UTF-16) —— 微信/QQ“复制图片文件+Ctrl+V”会插入原始文件(保透明/动图)
+    pub unsafe fn set_hdrop(path: &str) -> Result<(), String> {
+        #[repr(C)]
+        struct DROPFILES {
+            p_files: u32, // 距结构起头的文件列表偏移
+            pt: [i32; 2],
+            f_nc: u32,
+            f_wide: u32, // 1 = UTF-16
+        }
+        let wide: Vec<u16> = path.encode_utf16().collect();
+        let struct_bytes = std::mem::size_of::<DROPFILES>();
+        let payload_len = struct_bytes + (wide.len() + 1 + 1) * 2; // 路径 + 双 null
+        let h = GlobalAlloc(GMEM_MOVEABLE, payload_len).map_err(|e| format!("GlobalAlloc: {e}"))?;
+        let ptr = GlobalLock(h);
+        if ptr.is_null() {
+            return Err("GlobalLock failed".into());
+        }
+        unsafe {
+            let base = ptr as *mut u8;
+            let header = DROPFILES {
+                p_files: struct_bytes as u32,
+                pt: [0, 0],
+                f_nc: 0,
+                f_wide: 1,
+            };
+            std::ptr::copy_nonoverlapping((&header as *const DROPFILES) as *const u8, base, struct_bytes);
+            let dst = base.add(struct_bytes) as *mut u16;
+            for (i, c) in wide.iter().enumerate() {
+                *dst.add(i) = *c;
+            }
+            *dst.add(wide.len()) = 0;
+            *dst.add(wide.len() + 1) = 0;
+            let _ = GlobalUnlock(h);
+        }
+        SetClipboardData(15 /*CF_HDROP*/, HANDLE(h.0)).map_err(|e| format!("SetClipboardData CF_HDROP: {e}"))?;
         Ok(())
     }
 
@@ -634,16 +672,16 @@ fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: St
     #[cfg(target_os = "windows")]
     unsafe {
         win::set_clipboard(|| {
-            // 1) “PNG” 格式: PNG 原始字节 (保透明) / GIF 原始字节 (微信按动图解码)
+            // 1) CF_HDROP 真实文件路径: 微信/QQ 插入原始文件 (透明 PNG / 动图 GIF 全保留)
+            win::set_hdrop(&p.to_string_lossy())?;
+            // 2) FileGroupDescriptorW + FileContents 虚拟文件
+            win::set_gif(&bytes, &filename)?;
+            // 3) “PNG” 格式: PNG 原始字节 (保透明) / GIF 原始字节 (部分 app 按动图解码)
             if is_png || is_gif_file {
                 win::set_png_formats(&bytes)?;
             }
-            // 2) CF_DIB 兜底位图: BGRA + 白底合成
+            // 4) CF_DIB 兜底位图: BGRA + 白底合成 (仅给不识别文件的程序)
             win::set_dib(&rgba, w, h)?;
-            // 3) GIF 虚拟文件格式 (资源管理器“复制文件”)
-            if is_gif_file {
-                win::set_gif(&bytes, &filename)?;
-            }
             Ok(())
         })?;
     }

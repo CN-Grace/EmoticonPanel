@@ -121,9 +121,32 @@ fn main() {
             let _ = GlobalUnlock(h);
             SetClipboardData(f, HANDLE(h.0)).unwrap();
         }
+        // CF_HDROP: 真实路径
+        #[repr(C)]
+        struct DROPFILES {
+            p_files: u32,
+            pt: [i32; 2],
+            f_nc: u32,
+            f_wide: u32,
+        }
+        let hd_path = r"C:\Users\test\stickers\元气团子\01.gif";
+        let wide: Vec<u16> = hd_path.encode_utf16().collect();
+        let struct_bytes = std::mem::size_of::<DROPFILES>();
+        let payload = struct_bytes + (wide.len() + 2) * 2;
+        let hh = GlobalAlloc(GMEM_MOVEABLE, payload).unwrap();
+        let pp = GlobalLock(hh);
+        let base = pp as *mut u8;
+        let header = DROPFILES { p_files: struct_bytes as u32, pt: [0, 0], f_nc: 0, f_wide: 1 };
+        std::ptr::copy_nonoverlapping((&header as *const DROPFILES) as *const u8, base, struct_bytes);
+        let dst = base.add(struct_bytes) as *mut u16;
+        for (i, c) in wide.iter().enumerate() { *dst.add(i) = *c; }
+        *dst.add(wide.len()) = 0;
+        *dst.add(wide.len() + 1) = 0;
+        let _ = GlobalUnlock(hh);
+        SetClipboardData(15, HANDLE(hh.0)).unwrap();
         let _ = CloseClipboard();
     }
-    println!("  write OK (DIB + PNG + image/png + FileGroupDescriptorW + FileContents)");
+    println!("  write OK (DIB + PNG + image/png + FileGroupDescriptorW + FileContents + HDROP)");
 
     // ---- 3. 读回验证 ----
     println!("[2] read-back...");
@@ -163,6 +186,31 @@ fn main() {
         let fc_data = read_global(fc_h);
         assert_eq!(&fc_data[..], GIFB, "FileContents mismatch");
         println!("  FileContents == raw GIF bytes: OK");
+        // CF_HDROP 读回: 解析 DROPFILES + UTF-16 路径
+        if let Ok(h) = GetClipboardData(15) {
+            let hg = HGLOBAL(h.0);
+            let ptr = GlobalLock(hg);
+            let off = unsafe { *(ptr as *const u32) } as usize;
+            let names_ptr = ptr as *const u16;
+            let mut names = Vec::new();
+            let mut i = (off / 2) as usize;
+            loop {
+                let mut s = Vec::new();
+                while unsafe { *names_ptr.add(i) } != 0 {
+                    s.push(unsafe { *names_ptr.add(i) });
+                    i += 1;
+                }
+                i += 1;
+                if s.is_empty() { break; }
+                names.push(String::from_utf16_lossy(&s));
+            }
+            let _ = GlobalUnlock(hg);
+            println!("  CF_HDROP paths: {:?}", names);
+            assert!(names[0].ends_with("01.gif"), "HDROP path decode failed: {:?}", names);
+            println!("  CF_HDROP UTF-16 path decode: OK");
+        } else {
+            panic!("CF_HDROP read failed");
+        }
         let _ = CloseClipboard();
     }
 
