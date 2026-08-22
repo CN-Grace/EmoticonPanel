@@ -120,6 +120,8 @@ struct App {
     tabs_off: f32,
     tab_hover_last: Option<usize>,
     first_paths: Vec<PathBuf>,
+    thumb_order: std::collections::VecDeque<PathBuf>,
+    preview_order: std::collections::VecDeque<PathBuf>,
 }
 
 impl App {
@@ -154,6 +156,8 @@ impl App {
             tabs_off: 0.0,
             tab_hover_last: None,
             first_paths: Vec::new(),
+            thumb_order: std::collections::VecDeque::new(),
+            preview_order: std::collections::VecDeque::new(),
         };
         a.load_group(&cc.egui_ctx);
         a
@@ -165,13 +169,26 @@ impl App {
             .get(self.current)
             .and_then(|p| core::list_stickers(&self.root, &p.name).ok())
             .unwrap_or_default();
-        self.thumbs.clear();
-        self.previews.clear();
-        self.pending.clear();
-        // 读字节并入队后台解码 (最后一张先排, 保证可视区先出)
-        let mut paths: Vec<PathBuf> = self.stickers.iter().map(|s| s.path.clone()).collect();
-        paths.reverse();
-        for p in paths {
+        // 保留跨组缓存, 只对缺失贴图补解码任务; 当前组插队优先
+        let mut seen: std::collections::HashSet<PathBuf> = self.thumbs.keys().cloned().collect();
+        for (p, _) in self.pending.iter() {
+            seen.insert(p.clone());
+        }
+        let mut missing: Vec<PathBuf> = Vec::new();
+        for st in &self.stickers {
+            if !seen.contains(&st.path) {
+                missing.push(st.path.clone());
+            }
+        }
+        // 可视区(前16个)插队优先, 其余殿后
+        let head: Vec<PathBuf> = missing.iter().take(16).cloned().collect();
+        let tail: Vec<PathBuf> = missing.iter().skip(16).cloned().collect();
+        for p in tail {
+            if let Ok(bytes) = std::fs::read(&p) {
+                self.pending.push_back((p, bytes));
+            }
+        }
+        for p in head.into_iter().rev() {
             if let Ok(bytes) = std::fs::read(&p) {
                 self.pending.push_front((p, bytes));
             }
@@ -209,7 +226,24 @@ impl App {
                         }
                     }
                 }
-                self.thumbs.insert(path, Avatar { frames, delays, current: 0, last_time: 0.0 });
+                self.thumbs.insert(path.clone(), Avatar { frames, delays, current: 0, last_time: 0.0 });
+                self.thumb_order.push_back(path);
+            }
+        }
+        // 缩略图缓存上限: 逐出最旧的非当前组贴图
+        while self.thumbs.len() > 900 {
+            if let Some(old) = self.thumb_order.pop_front() {
+                let is_current = self.stickers.iter().any(|st| st.path == old);
+                if is_current {
+                    self.thumb_order.push_back(old);
+                    if self.thumb_order.len() > self.thumbs.len() * 2 {
+                        break;
+                    }
+                    continue;
+                }
+                self.thumbs.remove(&old);
+            } else {
+                break;
             }
         }
         if got > 0 || !self.pending.is_empty() {
@@ -282,6 +316,14 @@ impl App {
                     let color = egui::ColorImage::from_rgba_unmultiplied([nw as usize, nh as usize], small.as_raw());
                     let h = ctx.load_texture(format!("pv_{}", st.path.to_string_lossy()), color, TextureOptions::LINEAR);
                     self.previews.insert(st.path.clone(), h);
+                    self.preview_order.push_back(st.path.clone());
+                    while self.previews.len() > 250 {
+                        if let Some(old) = self.preview_order.pop_front() {
+                            self.previews.remove(&old);
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         }
