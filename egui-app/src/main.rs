@@ -21,7 +21,7 @@ const CELL_H: f32 = 97.0;
 const IMG: f32 = 72.0;
 const COLS: usize = 4;
 const W: f32 = 318.0;
-const H: f32 = 465.0;
+const H: f32 = 445.0;
 const BOTTOM_H: f32 = 46.0;
 const MAX_INFLIGHT: usize = 6;
 
@@ -168,7 +168,6 @@ impl App {
         self.thumbs.clear();
         self.previews.clear();
         self.pending.clear();
-        self.tabs_off = 0.0;
         // 读字节并入队后台解码 (最后一张先排, 保证可视区先出)
         let mut paths: Vec<PathBuf> = self.stickers.iter().map(|s| s.path.clone()).collect();
         paths.reverse();
@@ -641,7 +640,7 @@ impl eframe::App for App {
                     .auto_shrink([false, false])
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                     .show(ui, |ui| {
-                        ui.add_space(6.0);
+                        ui.add_space(4.0);
                         let stickers = self.stickers.clone();
                         let mut insert_err: Option<String> = None;
                         egui::Grid::new("stkgrid")
@@ -676,7 +675,7 @@ impl eframe::App for App {
                                 ui.label(RichText_13("还没有表情包 — 在 ⚙ 设置里选择位置或刷新").colored_opt(C_DIM));
                             });
                         }
-                        ui.add_space(10.0);
+                        ui.add_space(4.0);
                     });
             });
 
@@ -793,7 +792,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([W, H])
-            .with_min_inner_size([300.0, 445.0])
+            .with_resizable(false)
             .with_title("表情面板"),
         ..Default::default()
     };
