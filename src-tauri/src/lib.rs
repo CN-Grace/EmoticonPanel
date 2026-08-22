@@ -404,6 +404,14 @@ mod win {
         Ok(())
     }
 
+    /// “PNG”/“image/png” 注册格式 ← 原始文件字节。
+    /// PNG: 保透明; GIF: 微信/QQ 等从 image/png 名义读取后按实际字节(GIF 头)解码为动图。
+    pub unsafe fn set_png_formats(bytes: &[u8]) -> Result<(), String> {
+        set_data(RegisterClipboardFormatW(windows::core::w!("PNG")), bytes)?;
+        set_data(RegisterClipboardFormatW(windows::core::w!("image/png")), bytes)?;
+        Ok(())
+    }
+
     // ---------- 剪贴板 ----------
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
@@ -438,7 +446,8 @@ mod win {
         bi_clr_important: u32,
     }
 
-    /// 把 RGBA 像素写为 CF_DIB (32bpp BGRA, 顶底翻转)
+    /// 把 RGBA 像素写为 CF_DIB (32bpp, **BGRA 字节序**, 透明区域合成到白底)
+    /// 注意: DIB 低位字节是 B; 直接拷贝 RGBA 会导致 R/B 互换 (此前实测“主体变色”) 且透明像素 RGB=0 会被显示为黑底。
     pub unsafe fn set_dib(rgba: &[u8], w: u32, h: u32) -> Result<(), String> {
         let header = BITMAPINFOHEADER {
             bi_size: 40,
@@ -453,15 +462,22 @@ mod win {
             bi_clr_used: 0,
             bi_clr_important: 0,
         };
+        // RGBA -> BGRA 且 alpha 合成到白底 (聊天背景) 避免黑/脏边
+        let mut flipped = Vec::with_capacity(rgba.len());
+        for c in rgba.chunks_exact(4) {
+            let (r, g, b) = (c[0] as u32, c[1] as u32, c[2] as u32);
+            let a = c[3] as u32;
+            let blend = |v: u32| ((v * a + 255 * (255 - a)) / 255) as u8;
+            flipped.extend_from_slice(&[blend(b), blend(g), blend(r), 255]);
+        }
         let hb = unsafe {
-            let h = GlobalAlloc(GMEM_MOVEABLE, 40 + rgba.len()).map_err(|e| format!("GlobalAlloc: {e}"))?;
+            let h = GlobalAlloc(GMEM_MOVEABLE, 40 + flipped.len()).map_err(|e| format!("GlobalAlloc: {e}"))?;
             let ptr = GlobalLock(h);
             if ptr.is_null() {
                 return Err("GlobalLock failed".into());
             }
             std::ptr::copy_nonoverlapping((&header as *const BITMAPINFOHEADER) as *const u8, ptr as *mut u8, 40);
-            // RGBA -> 存 BGRA 同布局 (top-down 负高度, 低位字节优先 = B) 直接拷贝
-            std::ptr::copy_nonoverlapping(rgba.as_ptr(), (ptr as *mut u8).add(40), rgba.len());
+            std::ptr::copy_nonoverlapping(flipped.as_ptr(), (ptr as *mut u8).add(40), flipped.len());
             let _ = GlobalUnlock(h);
             h
         };
@@ -602,6 +618,13 @@ fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: St
         .unwrap_or("sticker")
         .to_string();
     let is_gif_file = is_gif(&p);
+    // 原图为 PNG 时塞“PNG”格式原始字节保透明
+    let ext_lower = p
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_png = ext_lower == "png";
 
     // 解码为 RGBA (gif 取第一帧)
     let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
@@ -611,7 +634,13 @@ fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: St
     #[cfg(target_os = "windows")]
     unsafe {
         win::set_clipboard(|| {
+            // 1) “PNG” 格式: PNG 原始字节 (保透明) / GIF 原始字节 (微信按动图解码)
+            if is_png || is_gif_file {
+                win::set_png_formats(&bytes)?;
+            }
+            // 2) CF_DIB 兜底位图: BGRA + 白底合成
             win::set_dib(&rgba, w, h)?;
+            // 3) GIF 虚拟文件格式 (资源管理器“复制文件”)
             if is_gif_file {
                 win::set_gif(&bytes, &filename)?;
             }

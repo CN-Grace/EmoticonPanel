@@ -13,7 +13,10 @@ npm run tauri build -- --no-bundle   # 正式构建 → src-tauri/target/release
 2. 点击任意表情 → 立即写入剪贴板并模拟 **Ctrl+V** 粘贴进目标窗口输入框
 3. 再点 attach 按钮可随时换目标;拾取中再点一次可取消
 
-> 粘贴方式:静态图走剪贴板位图(CF_DIB);GIF 额外附带 `FileGroupDescriptorW`/`FileContents`(资源管理器"复制文件"格式),微信等识别后可按**动图**插入。
+> 粘贴方式(剪贴板多种格式并存):
+- **`PNG`/`image/png` 注册格式 ← 原始文件字节**:PNG 保留透明;GIF 微信等按实际字节(GIF 头)解码为**动图**
+- **CF_DIB 兜底位图**:BGRA 字节序 + 透明区域合成白底,避免黑底/变色
+- GIF 额外附 `FileGroupDescriptorW`/`FileContents`(资源管理器"复制文件"格式)
 
 ## 表情包目录
 
