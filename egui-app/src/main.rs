@@ -345,17 +345,34 @@ impl App {
         st: &Sticker,
     ) -> egui::Response {
         self.ensure_thumb(ctx, &st.path);
+        let (rect, resp) = ui.allocate_exact_size(vec2(CELL_W, CELL_H), Sense::click());
+        let hover = ui.rect_contains_pointer(rect);
+        let painter = ui.painter();
+        if hover {
+            painter.rect(rect, Rounding::same(6.0), C_HOVER, Stroke::NONE);
+        }
+        // GIF 实时预览: 悬浮时按播放帧渲染, 否则静态第一帧
+        let is_gif_anim = self
+            .thumbs
+            .get(&st.path)
+            .map(|at| at.delays.len() > 1)
+            .unwrap_or(false);
         let tex = self
             .thumbs
             .get(&st.path)
-            .map(|at| at.frames[at.current].id())
+            .map(|at| {
+                if hover && is_gif_anim {
+                    // 请求持续重绘以播放动画
+                    ctx.request_repaint_after(Duration::from_millis(
+                        at.delays[at.current].clamp(20, 100),
+                    ));
+                    at.frames[at.current].id()
+                } else {
+                    at.frames[0].id()
+                }
+            })
             .unwrap_or(self.fallback.id());
-        let (rect, resp) = ui.allocate_exact_size(vec2(CELL_W, CELL_H), Sense::click());
-        let painter = ui.painter();
-        if resp.hovered() {
-            painter.rect(rect, Rounding::same(6.0), C_HOVER, Stroke::NONE);
-        }
-        // 75x75 图片
+        // 72x72 图片
         let img_rect = Rect::from_center_size(rect.center_top() + vec2(0.0, IMG / 2.0 + 3.0), vec2(IMG, IMG));
         painter.image(tex, img_rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), C_WHITE);
         // 文件名
