@@ -28,3 +28,4 @@ egui-app/target
 egui-app-lite/target
 
 .vscode/
+scripts/*.png
