@@ -133,8 +133,9 @@ struct App {
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     // 后台解码: 固定 worker 池 (MPMC)
-    job_static_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
-    job_anim_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
+    job_static_tx: crossbeam_channel::Sender<(PathBuf, Job)>,
+    job_anim_tx: crossbeam_channel::Sender<(PathBuf, Job)>,
+    retry: Vec<PathBuf>, // 队列满时未能入队的贴图, 轮询补发
     done_rx: std::sync::mpsc::Receiver<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     done_tx: std::sync::mpsc::Sender<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     tex_seq: u64,
@@ -158,31 +159,38 @@ impl App {
         let root = core::root_dir();
         let packages = core::list_packages(&root);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        // 动画任务独立小队列, 优先于静态洪水
-        let (anim_tx, anim_rx) = crossbeam_channel::bounded::<(PathBuf, Vec<u8>)>(16);
-        let (static_tx, static_rx) = crossbeam_channel::bounded::<(PathBuf, Vec<u8>)>(128);
-        // 固定 worker 池 (3 线程), anim 优先
+        // 动画任务独立队列(64), 优先于静态洪水(3) —— 任务只带路径, 读文件在 worker 内
+        let (anim_tx, anim_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(64);
+        let (static_tx, static_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(3);
         for _ in 0..MAX_INFLIGHT {
             let arx = anim_rx.clone();
             let srx = static_rx.clone();
             let tx = done_tx.clone();
             std::thread::spawn(move || {
                 loop {
-                    if let Ok((path, bytes)) = arx.try_recv() {
+                    if let Ok((path, job)) = arx.try_recv() {
                         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                            let (f, d) = decode_gif_frames(&bytes).unwrap_or_default();
-                            (path, Job::Anim, f, d)
+                            if let Ok(bytes) = std::fs::read(&path) {
+                                let (f, d) = decode_gif_frames(&bytes).unwrap_or_default();
+                                (path, Job::Anim, f, d)
+                            } else {
+                                (path, Job::Anim, Vec::new(), Vec::new())
+                            }
                         }));
-                        if let Ok((path, job, frames, delays)) = res {
-                            let _ = tx.send((path, job, frames, delays));
+                        if let Ok(x) = res {
+                            let _ = tx.send(x);
                         }
-                    } else if let Ok((path, bytes)) = srx.recv() {
+                    } else if let Ok((path, job)) = srx.recv() {
                         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                            let c = decode_static(&bytes).map(|c| vec![c]).unwrap_or_default();
-                            (path, Job::Static, c, Vec::new())
+                            if let Ok(bytes) = std::fs::read(&path) {
+                                let c = decode_static(&bytes).map(|c| vec![c]).unwrap_or_default();
+                                (path, Job::Static, c, Vec::new())
+                            } else {
+                                (path, Job::Static, Vec::new(), Vec::new())
+                            }
                         }));
-                        if let Ok((path, job, frames, delays)) = res {
-                            let _ = tx.send((path, job, frames, delays));
+                        if let Ok(x) = res {
+                            let _ = tx.send(x);
                         }
                     } else {
                         break;
@@ -207,6 +215,7 @@ impl App {
             folder_rx: None,
             job_static_tx: static_tx,
             job_anim_tx: anim_tx,
+            retry: Vec::new(),
             done_rx,
             done_tx,
             tex_seq: 0,
@@ -235,13 +244,13 @@ impl App {
         let head: Vec<PathBuf> = missing.iter().take(16).cloned().collect();
         let tail: Vec<PathBuf> = missing.iter().skip(16).cloned().collect();
         for p in tail {
-            if let Ok(bytes) = std::fs::read(&p) {
-                let _ = self.job_static_tx.try_send((p, bytes));
+            if self.job_static_tx.try_send((p.clone(), Job::Static)).is_err() {
+                self.retry.push(p);
             }
         }
         for p in head.into_iter().rev() {
-            if let Ok(bytes) = std::fs::read(&p) {
-                let _ = self.job_static_tx.try_send((p, bytes));
+            if self.job_static_tx.try_send((p.clone(), Job::Static)).is_err() {
+                self.retry.push(p);
             }
         }
         if !missing.is_empty() {
@@ -253,7 +262,12 @@ impl App {
     /// 每帧: 收 worker 完成结果, 主线程创建纹理
     fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
-        while let Ok((path, job, colors, delays)) = self.done_rx.try_recv() {
+        while got < 24 {
+            let it = match self.done_rx.try_recv() {
+                Ok(x) => x,
+                Err(_) => break,
+            };
+            let (path, job, colors, delays) = it;
             got += 1;
             match job {
                 Job::Static => {
@@ -307,14 +321,24 @@ impl App {
                 break;
             }
         }
+        // 队列有空位时补发之前被拒的任务
+        if !self.retry.is_empty() && got < 24 {
+            self.retry.retain(|p| {
+                if self.job_static_tx.try_send((p.clone(), Job::Static)).is_err() {
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         if got > 0 {
             ctx.request_repaint();
         }
     }
 
-    /// 动画帧 LRU: 上限 24, 逐出最旧 (释放纹理显存/内存)
+    /// 动画帧 LRU: 上限 48, 逐出最旧 (释放纹理显存/内存)
     fn trim_anim(&mut self) {
-        while self.anim_order.len() > 24 {
+        while self.anim_order.len() > 48 {
             if let Some(old) = self.anim_order.pop_front() {
                 if let Some(av) = self.thumbs.get_mut(&old) {
                     av.anim = None;
@@ -349,10 +373,10 @@ impl App {
             if fp.as_os_str().is_empty() || seen.contains(&fp) {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&fp) {
-                seen.insert(fp.clone());
-                let _ = self.job_static_tx.try_send((fp, bytes));
+            if self.job_static_tx.try_send((fp.clone(), Job::Static)).is_err() {
+                self.retry.push(fp.clone());
             }
+            seen.insert(fp);
         }
         ctx.request_repaint();
     }
@@ -374,8 +398,8 @@ impl App {
                 path.to_path_buf(),
                 Avatar { static_tex: placeholder, anim: None },
             );
-            if let Ok(bytes) = std::fs::read(path) {
-                let _ = self.job_static_tx.try_send((path.to_path_buf(), bytes));
+            if self.job_static_tx.try_send((path.to_path_buf(), Job::Static)).is_err() {
+                self.retry.push(path.to_path_buf());
             }
         }
     }
@@ -386,27 +410,31 @@ impl App {
         if self.thumbs.get(path).map(|av| av.anim.is_some()).unwrap_or(false) {
             return;
         }
-        if let Ok(bytes) = std::fs::read(path) {
-            let p = path.to_path_buf();
-            if self.job_anim_tx.try_send((p.clone(), bytes.clone())).is_err() {
-                // 动画队列满: 主线程同步解 (72px GIF, 通常 <50ms) 保证 hover 必动
-                if let Some((colors, delays)) = decode_gif_frames(&bytes) {
-                    if colors.len() > 1 {
-                        let mut frames = Vec::with_capacity(colors.len());
-                        for (i, c) in colors.iter().enumerate() {
-                            self.tex_seq += 1;
-                            frames.push(ctx.load_texture(format!("a{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
-                        }
-                        if let Some(av) = self.thumbs.get_mut(&p) {
-                            av.anim = Some(Animated { frames, delays, current: 0, last_time: 0.0, elapsed_ms: 0 });
-                            self.anim_order.retain(|q| *q != p);
-                            self.anim_order.push_back(p);
-                            self.trim_anim();
-                            // 同步建好后必须请求重绘, 否则本帧不刷新 (首次 hover 见不到效果)
-                            ctx.request_repaint();
+        let p = path.to_path_buf();
+        if self.job_anim_tx.try_send((p.clone(), Job::Anim)).is_err() {
+            // 动画队列满: 仅对小文件(<300KB)主线程同步解, 避免大 GIF 卡 UI; 大文件记录重试
+            let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            if size > 0 && size <= 300 * 1024 {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    if let Some((colors, delays)) = decode_gif_frames(&bytes) {
+                        if colors.len() > 1 {
+                            let mut frames = Vec::with_capacity(colors.len());
+                            for (i, c) in colors.iter().enumerate() {
+                                self.tex_seq += 1;
+                                frames.push(ctx.load_texture(format!("a{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
+                            }
+                            if let Some(av) = self.thumbs.get_mut(&p) {
+                                av.anim = Some(Animated { frames, delays, current: 0, last_time: 0.0, elapsed_ms: 0 });
+                                self.anim_order.retain(|q| *q != p);
+                                self.anim_order.push_back(p);
+                                self.trim_anim();
+                                ctx.request_repaint();
+                            }
                         }
                     }
                 }
+            } else {
+                self.retry.push(p.clone());
             }
         }
     }
