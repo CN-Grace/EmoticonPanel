@@ -186,35 +186,39 @@ impl App {
             let tx = done_tx.clone();
             let wx = ectx.clone();
             std::thread::spawn(move || {
+                use crossbeam_channel::select;
+                let mut handle = |path: PathBuf, job: Job| {
+                    let path2 = path.clone();
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        if let Ok(bytes) = std::fs::read(&path) {
+                            match job {
+                                Job::Anim => {
+                                    let (f, d) = decode_gif_frames(&bytes).unwrap_or_default();
+                                    (path2, Job::Anim, f, d)
+                                }
+                                Job::Static => {
+                                    let c = decode_static(&bytes).map(|c| vec![c]).unwrap_or_default();
+                                    (path2, Job::Static, c, Vec::new())
+                                }
+                            }
+                        } else {
+                            (path2, job, Vec::new(), Vec::new())
+                        }
+                    }));
+                    if let Ok(x) = res {
+                        let _ = tx.send(x); // 满时阻塞(背压), 内存受控
+                        wx.request_repaint();
+                    }
+                };
                 loop {
-                    if let Ok((path, job)) = arx.try_recv() {
-                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                            if let Ok(bytes) = std::fs::read(&path) {
-                                let (f, d) = decode_gif_frames(&bytes).unwrap_or_default();
-                                (path, Job::Anim, f, d)
-                            } else {
-                                (path, Job::Anim, Vec::new(), Vec::new())
-                            }
-                        }));
-                        if let Ok(x) = res {
-                            let _ = tx.send(x); // 满时阻塞(背压), 内存受控
-                            wx.request_repaint();
-                        }
-                    } else if let Ok((path, job)) = srx.recv() {
-                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                            if let Ok(bytes) = std::fs::read(&path) {
-                                let c = decode_static(&bytes).map(|c| vec![c]).unwrap_or_default();
-                                (path, Job::Static, c, Vec::new())
-                            } else {
-                                (path, Job::Static, Vec::new(), Vec::new())
-                            }
-                        }));
-                        if let Ok(x) = res {
-                            let _ = tx.send(x); // 满时阻塞(背压), 内存受控
-                            wx.request_repaint();
-                        }
-                    } else {
-                        break;
+                    if let Ok((p, j)) = arx.try_recv() {
+                        handle(p, j);
+                        continue;
+                    }
+                    // 关键: select 同时监听两队列 — static 空时 anim 也能被唤醒, 不阻塞死锁
+                    select! {
+                        recv(srx) -> r => if let Ok((p, j)) = r { handle(p, j); },
+                        recv(arx) -> r => if let Ok((p, j)) = r { handle(p, j); },
                     }
                 }
             });
