@@ -136,13 +136,14 @@ struct App {
     job_static_tx: crossbeam_channel::Sender<(PathBuf, Job)>,
     job_anim_tx: crossbeam_channel::Sender<(PathBuf, Job)>,
     retry: Vec<PathBuf>, // 队列满时未能入队的贴图, 轮询补发
+    pending: std::collections::VecDeque<PathBuf>, // 大组延迟加载池
     // 后台扫描: 一次性返回全部分组 + 每组贴图列表, UI 线程零目录 IO
     scan_rx: std::sync::mpsc::Receiver<core::ScanResult>,
     scan_tx: std::sync::mpsc::Sender<core::ScanResult>,
     pkg_cache: HashMap<String, Vec<Sticker>>,
     scan_seq: u64,
-    done_rx: std::sync::mpsc::Receiver<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
-    done_tx: std::sync::mpsc::Sender<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
+    done_rx: crossbeam_channel::Receiver<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
+    done_tx: crossbeam_channel::Sender<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     tex_seq: u64,
     tabs_off: f32,
     tab_hover_last: Option<usize>,
@@ -175,8 +176,8 @@ impl App {
             });
         }
         let packages: Vec<core::Package> = Vec::new();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        // 动画任务独立队列(64), 优先于静态洪水(3) —— 任务只带路径, 读文件在 worker 内
+        // done 有界(512) + send 阻塞背压: 防止按千计的解码结果(GB级 ColorImage)无限堆积 -> 系统冻结
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>(512);
         let (anim_tx, anim_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(64);
         let (static_tx, static_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(6);
         for _ in 0..MAX_INFLIGHT {
@@ -196,7 +197,7 @@ impl App {
                             }
                         }));
                         if let Ok(x) = res {
-                            let _ = tx.send(x);
+                            let _ = tx.send(x); // 满时阻塞(背压), 内存受控
                             wx.request_repaint();
                         }
                     } else if let Ok((path, job)) = srx.recv() {
@@ -209,7 +210,7 @@ impl App {
                             }
                         }));
                         if let Ok(x) = res {
-                            let _ = tx.send(x);
+                            let _ = tx.send(x); // 满时阻塞(背压), 内存受控
                             wx.request_repaint();
                         }
                     } else {
@@ -236,6 +237,7 @@ impl App {
             job_static_tx: static_tx,
             job_anim_tx: anim_tx,
             retry: Vec::new(),
+            pending: std::collections::VecDeque::new(),
             scan_rx,
             scan_tx,
             pkg_cache: HashMap::new(),
@@ -268,9 +270,16 @@ impl App {
         }
         let head: Vec<PathBuf> = missing.iter().take(16).cloned().collect();
         let tail: Vec<PathBuf> = missing.iter().skip(16).cloned().collect();
-        for p in tail {
+        // 只入队前 128, 其余进 pending 池由每帧缓慢补充 (避免一次性堆出千级任务)
+        let (now, later) = tail.split_at(tail.len().min(112));
+        for p in now {
             if self.job_static_tx.try_send((p.clone(), Job::Static)).is_err() {
-                self.retry.push(p);
+                self.retry.push(p.clone());
+            }
+        }
+        for p in later {
+            if !self.pending.contains(p) {
+                self.pending.push_back(p.clone());
             }
         }
         for p in head.into_iter().rev() {
@@ -288,8 +297,6 @@ impl App {
     /// 消费后台扫描结果
     fn poll_scan(&mut self, ctx: &egui::Context) {
         while let Ok(r) = self.scan_rx.try_recv() {
-            eprintln!("[scan-p] gotx={}", r.packages.len());
-            eprintln!("[scan-p] GOT result pkgs={}", r.packages.len());
             let changed = r.packages.len() != self.packages.len()
                 || self.packages.iter().zip(r.packages.iter()).any(|(a, b)| a.name != b.name);
             if !changed {
@@ -368,8 +375,25 @@ impl App {
                 break;
             }
         }
+        // 大组延迟池: 每帧最多补 12 个 (平滑加载, 不一次堆出)
+        if got < 20 {
+            let mut fed = 0;
+            while fed < 12 {
+                match self.pending.pop_front() {
+                    Some(p) => {
+                        if self.job_static_tx.try_send((p.clone(), Job::Static)).is_err() {
+                            self.retry.push(p);
+                            break;
+                        }
+                        fed += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
         // 队列有空位时补发之前被拒的任务
         if !self.retry.is_empty() && got < 24 {
+            let _ = ctx;
             self.retry.retain(|p| {
                 if self.job_static_tx.try_send((p.clone(), Job::Static)).is_err() {
                     true
