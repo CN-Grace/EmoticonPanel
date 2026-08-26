@@ -114,8 +114,8 @@ struct App {
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     // 后台解码: 固定 worker 池 (MPMC)
     job_tx: crossbeam_channel::Sender<PathBuf>,
-    done_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
-    done_tx: std::sync::mpsc::Sender<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
+    done_rx: crossbeam_channel::Receiver<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
+    done_tx: crossbeam_channel::Sender<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
     tex_seq: u64,
     tabs_off: f32,
     tab_hover_last: Option<usize>,
@@ -135,7 +135,8 @@ impl App {
             .load_texture("fb", egui::ColorImage::from_rgba_unmultiplied([4, 4], &[230; 64]), TextureOptions::LINEAR);
         let root = core::root_dir();
         let packages = core::list_packages(&root);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // done 有界(512)+阻塞背压: 防止大组解码结果(GB级帧数据)无限堆积致内存耗尽
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>(512);
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<PathBuf>();
         // 固定 worker 池: 读文件+解码全在 worker (主线程零大 IO), catch_unwind 防队列停摆
         let ectx = cc.egui_ctx.clone();
@@ -155,7 +156,7 @@ impl App {
                         Ok(Some((f, d))) => (f, d),
                         _ => (Vec::new(), Vec::new()),
                     };
-                    let _ = tx.send((path2, frames, delays));
+                    let _ = tx.send((path2, frames, delays)); // 满时阻塞(背压), 内存受控
                     wx.request_repaint(); // 闲置时 egui 不重绘, 解码完成必须主动唤醒
                 }
             });
