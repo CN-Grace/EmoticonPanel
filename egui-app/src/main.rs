@@ -113,7 +113,7 @@ struct App {
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
     // 后台解码: 固定 worker 池 (MPMC)
-    job_tx: crossbeam_channel::Sender<(PathBuf, Vec<u8>)>,
+    job_tx: crossbeam_channel::Sender<PathBuf>,
     done_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
     done_tx: std::sync::mpsc::Sender<(PathBuf, Vec<egui::ColorImage>, Vec<u64>)>,
     tex_seq: u64,
@@ -136,23 +136,24 @@ impl App {
         let root = core::root_dir();
         let packages = core::list_packages(&root);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let (job_tx, job_rx) = crossbeam_channel::unbounded::<(PathBuf, Vec<u8>)>();
-        // 固定 worker 池: catch_unwind 防崩溃导致队列停摆
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        // 固定 worker 池: 读文件+解码全在 worker (主线程零大 IO), catch_unwind 防队列停摆
         for _ in 0..MAX_INFLIGHT {
             let rx = job_rx.clone();
-            let ctx = cc.egui_ctx.clone();
             let tx = done_tx.clone();
             std::thread::spawn(move || {
-                let _ = ctx;
-                while let Ok((path, bytes)) = rx.recv() {
+                while let Ok(path) = rx.recv() {
+                    let path2 = path.clone();
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        decode_frames(&bytes, THUMB_MAX)
+                        std::fs::read(&path) // 主线程不再读大文件
+                            .ok()
+                            .and_then(|bytes| decode_frames(&bytes, THUMB_MAX))
                     }));
                     let (frames, delays) = match res {
                         Ok(Some((f, d))) => (f, d),
                         _ => (Vec::new(), Vec::new()),
                     };
-                    let _ = tx.send((path, frames, delays));
+                    let _ = tx.send((path2, frames, delays));
                 }
             });
         }
@@ -199,14 +200,10 @@ impl App {
         let head: Vec<PathBuf> = missing.iter().take(16).cloned().collect();
         let tail: Vec<PathBuf> = missing.iter().skip(16).cloned().collect();
         for p in tail {
-            if let Ok(bytes) = std::fs::read(&p) {
-                let _ = self.job_tx.send((p, bytes));
-            }
+            let _ = self.job_tx.send(p);
         }
         for p in head.into_iter().rev() {
-            if let Ok(bytes) = std::fs::read(&p) {
-                let _ = self.job_tx.send((p, bytes));
-            }
+            let _ = self.job_tx.send(p);
         }
         if !missing.is_empty() {
             ctx.request_repaint();
@@ -217,7 +214,11 @@ impl App {
     /// 每帧: 收 worker 完成结果, 主线程创建纹理
     fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
-        while let Ok((path, colors, delays)) = self.done_rx.try_recv() {
+        while got < 24 {
+            let (path, colors, delays) = match self.done_rx.try_recv() {
+                Ok(x) => x,
+                Err(_) => break,
+            };
             got += 1;
             if !colors.is_empty() {
                 // 主线程逐帧建纹理
@@ -282,10 +283,8 @@ impl App {
             if fp.as_os_str().is_empty() || seen.contains(&fp) {
                 continue;
             }
-            if let Ok(bytes) = std::fs::read(&fp) {
-                seen.insert(fp.clone());
-                let _ = self.job_tx.send((fp, bytes));
-            }
+            seen.insert(fp.clone());
+            let _ = self.job_tx.send(fp);
         }
         ctx.request_repaint();
     }
@@ -299,19 +298,9 @@ impl App {
         self.load_group(ctx);
     }
 
-    fn ensure_thumb(&mut self, ctx: &egui::Context, path: &std::path::Path) {
+    fn ensure_thumb(&mut self, _ctx: &egui::Context, path: &std::path::Path) {
         if !self.thumbs.contains_key(path) {
-            if let Ok(bytes) = std::fs::read(path) {
-                if let Some((colors, delays)) = decode_frames(&bytes, THUMB_MAX) {
-                    let mut frames = Vec::with_capacity(colors.len());
-                    for (i, c) in colors.iter().enumerate() {
-                        self.tex_seq += 1;
-                        frames.push(ctx.load_texture(format!("t{}", self.tex_seq), c.clone(), TextureOptions::LINEAR));
-                    }
-                    self.thumbs.insert(path.to_path_buf(), Avatar { frames, delays, current: 0, last_time: 0.0, elapsed_ms: 0 });
-                    self.thumb_order.push_back(path.to_path_buf());
-                }
-            }
+            let _ = self.job_tx.send(path.to_path_buf()); // 解码由 worker 完成
         }
     }
 
