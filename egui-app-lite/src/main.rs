@@ -544,14 +544,21 @@ impl App {
         }
     }
 
+    /// 虚拟化渲染: 仅可见行才完整绘制/解码/命中
     fn sticker_cell(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         st: &Sticker,
-    ) -> egui::Response {
+        rect: egui::Rect,
+        resp: &egui::Response,
+        clip: egui::Rect,
+    ) -> bool {
+        let visible = rect.bottom() >= clip.top() - 8.0 && rect.top() <= clip.bottom() + 8.0;
+        if !visible {
+            return false; // 不可见: 不 ensure/不绘制 (大组不再全量解码)
+        }
         self.ensure_thumb(ctx, &st.path);
-        let (rect, resp) = ui.allocate_exact_size(vec2(CELL_W, CELL_H), Sense::click());
         let hover = ui.rect_contains_pointer(rect);
         let painter = ui.painter();
         if hover {
@@ -589,7 +596,7 @@ impl App {
             FontId::proportional(9.5),
             C_DIM,
         );
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        true
     }
 
     fn draw_tab_chip(
@@ -912,9 +919,11 @@ impl eframe::App for App {
                             .max_col_width(CELL_W)
                             .spacing(vec2(5.0, 0.0))
                             .show(ui, |ui| {
+                                let clip = ui.clip_rect();
                                 for (i, st) in stickers.iter().enumerate() {
-                                    let resp = self.sticker_cell(ui, ctx, st);
-                                    if resp.clicked() {
+                                    let (rect, resp) = ui.allocate_exact_size(vec2(CELL_W, CELL_H), Sense::click());
+                                    let visible = self.sticker_cell(ui, ctx, st, rect, &resp, clip);
+                                    if visible && resp.clicked() {
                                         match core::insert_sticker(&self.attach, &self.root, &st.path) {
                                             Ok(()) => {
                                                 let proc = self.attach.target.lock().unwrap().clone().map(|t| t.process).unwrap_or_default();
