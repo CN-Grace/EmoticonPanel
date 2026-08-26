@@ -138,14 +138,16 @@ impl App {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<PathBuf>();
         // 固定 worker 池: 读文件+解码全在 worker (主线程零大 IO), catch_unwind 防队列停摆
+        let ectx = cc.egui_ctx.clone();
         for _ in 0..MAX_INFLIGHT {
             let rx = job_rx.clone();
             let tx = done_tx.clone();
+            let wx = ectx.clone();
             std::thread::spawn(move || {
                 while let Ok(path) = rx.recv() {
                     let path2 = path.clone();
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        std::fs::read(&path) // 主线程不再读大文件
+                        std::fs::read(&path)
                             .ok()
                             .and_then(|bytes| decode_frames(&bytes, THUMB_MAX))
                     }));
@@ -154,6 +156,7 @@ impl App {
                         _ => (Vec::new(), Vec::new()),
                     };
                     let _ = tx.send((path2, frames, delays));
+                    wx.request_repaint(); // 闲置时 egui 不重绘, 解码完成必须主动唤醒
                 }
             });
         }
