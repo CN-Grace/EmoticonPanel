@@ -597,3 +597,20 @@ pub fn insert_sticker(attach: &Attach, root: &Path, path: &Path) -> Result<(), S
     win::activate_and_paste(target.hwnd)?;
     Ok(())
 }
+
+/// 后台全量扫描: 返回所有分组 + 每组贴图列表 (一次性完成, 不在 UI 线程执行)
+pub struct ScanResult {
+    pub packages: Vec<Package>,
+    pub entries: std::collections::HashMap<String, Vec<Sticker>>,
+}
+
+pub fn scan_all(root: &Path) -> ScanResult {
+    let packages = list_packages(root);
+    let mut entries = std::collections::HashMap::new();
+    for p in &packages {
+        if let Ok(ss) = list_stickers(root, &p.name) {
+            entries.insert(p.name.clone(), ss);
+        }
+    }
+    ScanResult { packages, entries }
+}

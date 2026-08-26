@@ -14,7 +14,7 @@ public class W3 {
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 }
 "@
-$proc_pid = (Get-Process emoticon-panel-egui -ErrorAction SilentlyContinue | Select-Object -First 1).Id
+$proc_pid = (Get-Process emoticon-panel-lite -ErrorAction SilentlyContinue | Select-Object -First 1).Id
 if (-not $proc_pid) { Write-Output "app not running"; exit 1 }
 $hits = New-Object System.Collections.ArrayList
 $cb = [W3+EnumProc]{

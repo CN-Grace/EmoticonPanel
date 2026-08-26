@@ -22,7 +22,7 @@ const COLS: usize = 4;
 const W: f32 = 318.0;
 const H: f32 = 445.0;
 const BOTTOM_H: f32 = 46.0;
-const MAX_INFLIGHT: usize = 3;
+const MAX_INFLIGHT: usize = 6;
 
 // 微信风格配色
 const C_WHITE: Color32 = Color32::WHITE;
@@ -136,6 +136,11 @@ struct App {
     job_static_tx: crossbeam_channel::Sender<(PathBuf, Job)>,
     job_anim_tx: crossbeam_channel::Sender<(PathBuf, Job)>,
     retry: Vec<PathBuf>, // 队列满时未能入队的贴图, 轮询补发
+    // 后台扫描: 一次性返回全部分组 + 每组贴图列表, UI 线程零目录 IO
+    scan_rx: std::sync::mpsc::Receiver<core::ScanResult>,
+    scan_tx: std::sync::mpsc::Sender<core::ScanResult>,
+    pkg_cache: HashMap<String, Vec<Sticker>>,
+    scan_seq: u64,
     done_rx: std::sync::mpsc::Receiver<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     done_tx: std::sync::mpsc::Sender<(PathBuf, Job, Vec<egui::ColorImage>, Vec<u64>)>,
     tex_seq: u64,
@@ -157,15 +162,28 @@ impl App {
             .egui_ctx
             .load_texture("fb", egui::ColorImage::from_rgba_unmultiplied([4, 4], &[230; 64]), TextureOptions::LINEAR);
         let root = core::root_dir();
-        let packages = core::list_packages(&root);
+        let (scan_tx, scan_rx) = std::sync::mpsc::channel::<core::ScanResult>();
+        let ectx = cc.egui_ctx.clone();
+        {
+            let root = root.clone();
+            let tx = scan_tx.clone();
+            let sx = ectx.clone();
+            std::thread::spawn(move || {
+                let r = core::scan_all(&root);
+                let _ = tx.send(r);
+                sx.request_repaint(); // 扫描完成唤醒 UI (闲置时 egui 不重绘, 必须主动唤醒)
+            });
+        }
+        let packages: Vec<core::Package> = Vec::new();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         // 动画任务独立队列(64), 优先于静态洪水(3) —— 任务只带路径, 读文件在 worker 内
         let (anim_tx, anim_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(64);
-        let (static_tx, static_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(3);
+        let (static_tx, static_rx) = crossbeam_channel::bounded::<(PathBuf, Job)>(6);
         for _ in 0..MAX_INFLIGHT {
             let arx = anim_rx.clone();
             let srx = static_rx.clone();
             let tx = done_tx.clone();
+            let wx = ectx.clone();
             std::thread::spawn(move || {
                 loop {
                     if let Ok((path, job)) = arx.try_recv() {
@@ -179,6 +197,7 @@ impl App {
                         }));
                         if let Ok(x) = res {
                             let _ = tx.send(x);
+                            wx.request_repaint();
                         }
                     } else if let Ok((path, job)) = srx.recv() {
                         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -191,6 +210,7 @@ impl App {
                         }));
                         if let Ok(x) = res {
                             let _ = tx.send(x);
+                            wx.request_repaint();
                         }
                     } else {
                         break;
@@ -216,6 +236,10 @@ impl App {
             job_static_tx: static_tx,
             job_anim_tx: anim_tx,
             retry: Vec::new(),
+            scan_rx,
+            scan_tx,
+            pkg_cache: HashMap::new(),
+            scan_seq: 0,
             done_rx,
             done_tx,
             tex_seq: 0,
@@ -229,10 +253,11 @@ impl App {
     }
 
     fn load_group(&mut self, ctx: &egui::Context) {
+        // 从后台扫描缓存取贴图列表 (UI 线程不做任何目录 IO)
         self.stickers = self
             .packages
             .get(self.current)
-            .and_then(|p| core::list_stickers(&self.root, &p.name).ok())
+            .and_then(|p| self.pkg_cache.get(&p.name).cloned())
             .unwrap_or_default();
         // 保留跨组缓存, 只对缺失贴图发起解码; 可视区优先
         let mut missing: Vec<PathBuf> = Vec::new();
@@ -260,6 +285,28 @@ impl App {
     }
 
     /// 每帧: 收 worker 完成结果, 主线程创建纹理
+    /// 消费后台扫描结果
+    fn poll_scan(&mut self, ctx: &egui::Context) {
+        while let Ok(r) = self.scan_rx.try_recv() {
+            eprintln!("[scan-p] gotx={}", r.packages.len());
+            eprintln!("[scan-p] GOT result pkgs={}", r.packages.len());
+            let changed = r.packages.len() != self.packages.len()
+                || self.packages.iter().zip(r.packages.iter()).any(|(a, b)| a.name != b.name);
+            if !changed {
+                continue; // 重复/无变化结果
+            }
+            self.packages = r.packages;
+            self.pkg_cache = r.entries;
+            if self.current >= self.packages.len() {
+                self.current = 0;
+            }
+            self.load_group(ctx);
+            self.rebuild_tab_covers(ctx);
+            ctx.request_repaint();
+            break;
+        }
+    }
+
     fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
         while got < 24 {
@@ -350,16 +397,11 @@ impl App {
     }
 
     fn rebuild_tab_covers(&mut self, ctx: &egui::Context) {
+        // 封面路径直接来自扫描结果 (packages[].cover/first), UI 线程零目录 IO
         self.first_paths.clear();
-        // 先 take 旧封面 (绝不能先 clear), 否则 keep 丢失 -> 切组后封面全消失
         let old: Vec<Option<TextureHandle>> = std::mem::take(&mut self.tab_cover);
         for (idx, p) in self.packages.iter().enumerate() {
-            if let Ok(ss) = core::list_stickers(&self.root, &p.name) {
-                self.first_paths.push(ss.first().map(|f| f.path.clone()).unwrap_or_default());
-            } else {
-                self.first_paths.push(PathBuf::new());
-            }
-            // 保留已解码封面, 否则回退占位
+            self.first_paths.push(p.cover.clone().unwrap_or_default());
             let keep = old
                 .get(idx)
                 .and_then(|c| c.as_ref())
@@ -383,11 +425,18 @@ impl App {
 
     fn refresh(&mut self, ctx: &egui::Context) {
         self.root = core::root_dir();
-        if self.current >= self.packages.len() {
-            self.current = 0;
-        }
-        self.packages = core::list_packages(&self.root);
-        self.load_group(ctx);
+        self.scan_seq += 1;
+        let root = self.root.clone();
+        let tx = self.scan_tx.clone();
+        let wx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = core::scan_all(&root);
+            let _ = tx.send(r);
+            wx.request_repaint();
+        });
+        self.packages.clear();
+        self.stickers.clear();
+        self.toast = Some(("正在扫描表情包…".into(), std::time::Instant::now()));
     }
 
     /// 确保静态缩略图存在 (占位 + Job::Static 入队; 纹理由 worker 解码后主线程建)
@@ -552,6 +601,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_scan(ctx);
         self.poll_done(ctx);
         self.advance_animations(ctx);
         if self.attach.picking.load(std::sync::atomic::Ordering::SeqCst) {
