@@ -52,6 +52,10 @@ unsafe extern "system" fn win_loc_proc(
                 );
             }
         }
+        // 位置已系统级搬移(跟手); 同时保持帧推进, 悬浮 GIF 动画才不停滞
+        if let Some(ctx) = WATCH_CTX.get() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         // 显隐/最小化变化 -> 唤醒 UI 处理 (Minimized 命令需要 egui)
         let vis = core::win::target_visible(target) as isize;
         let prev = LAST_VIS.swap(vis, AOrder::Relaxed);
