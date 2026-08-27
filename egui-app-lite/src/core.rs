@@ -587,7 +587,7 @@ pub mod win {
             RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
         };
         let w = r.right - r.left;
-        let gap = 2; // 侧边贴近, 不悬空
+        let gap = 0; // 侧边 0 间距, 紧贴
         // 右下角优先: 面板底对齐客户区底, 贴右 +gap
         let mut x = r.left + w + gap;
         let mut y = client_bottom - panel_h;
