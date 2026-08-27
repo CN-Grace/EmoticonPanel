@@ -103,6 +103,20 @@ pub fn set_stickers_dir(path: &str) -> Result<PathBuf, String> {
     Ok(p)
 }
 
+/// 跟随窗口 (面板随目标进程 显示/隐藏/移动)
+pub fn get_follow_window() -> bool {
+    read_settings()
+        .get("followWindow")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn set_follow_window(v: bool) -> Result<(), String> {
+    let mut s = read_settings();
+    s["followWindow"] = serde_json::json!(v);
+    write_settings(&s)
+}
+
 /// 始终置顶 状态
 pub fn get_always_on_top() -> bool {
     read_settings()
@@ -250,9 +264,10 @@ pub mod win {
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
-        ShowWindow, SW_RESTORE,
+        GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
     use windows::core::PWSTR;
 
@@ -514,6 +529,38 @@ pub mod win {
             let _ = keybd_event(VK_CONTROL.0 as u8, 0, KEYEVENTF_KEYUP, 0);
         }
         Ok(())
+    }
+    /// 目标窗口跟随信息: (面板x, y, 目标可见?) — 贴右(+8), 超界放左, 夹工作区
+    pub unsafe fn follow_target(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32, bool)> {
+        use windows::Win32::Foundation::RECT;
+        let hwnd = HWND(hwnd as *mut _);
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return None;
+        }
+        let visible = IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool();
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work = if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
+        };
+        let w = r.right - r.left;
+        let mut x = r.left + w + 8;
+        let mut y = r.top;
+        if x + panel_w > work.right {
+            x = r.left - 8 - panel_w;
+        }
+        x = x.max(work.left);
+        y = y.max(work.top).min(work.bottom - panel_h).max(work.top);
+        Some((x, y, visible))
     }
 }
 

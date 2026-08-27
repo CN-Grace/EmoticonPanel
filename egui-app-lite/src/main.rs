@@ -129,6 +129,8 @@ struct App {
     fallback: TextureHandle,
     show_settings: bool,
     always_on_top: bool, // 设置: 窗口始终置顶
+    follow_window: bool, // 设置: 面板随目标进程 显示/隐藏/移动
+    follow_t: f64,
     menu: Option<(Pos2, usize)>, // 右键菜单位置 + 分组索引
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -235,6 +237,8 @@ impl App {
             fallback,
             show_settings: false,
             always_on_top: core::get_always_on_top(),
+            follow_window: core::get_follow_window(),
+            follow_t: 0.0,
             menu: None,
             toast: None,
             folder_rx: None,
@@ -254,6 +258,15 @@ impl App {
             first_paths: Vec::new(),
             thumb_order: std::collections::VecDeque::new(),
                                                 };
+        // debug-only: EMOTICON_TEST_ATTACH=<hwnd> 自动附加, 用于跟随功能自动化自验
+        #[cfg(debug_assertions)]
+        if let Ok(ht) = std::env::var("EMOTICON_TEST_ATTACH") {
+            if let Ok(hw) = ht.trim().parse::<isize>() {
+                if let Ok(mut tg) = a.attach.target.lock() {
+                    *tg = Some(core::TargetInfo { hwnd: hw, title: "auto-test".into(), process: "auto-test".into(), pid: 0 });
+                }
+            }
+        }
         a.load_group(&cc.egui_ctx);
         a
     }
@@ -299,6 +312,29 @@ impl App {
 
     /// 每帧: 收 worker 完成结果, 主线程创建纹理
     /// 消费后台扫描结果
+    /// 跟随目标进程: 面板随被选定窗口 显示/隐藏/移动 (贴靠其右侧)
+    fn follow_tick(&mut self, ctx: &egui::Context) {
+        if !self.follow_window {
+            return;
+        }
+        self.follow_t += ctx.input(|i| i.stable_dt as f64);
+        if self.follow_t < 0.2 {
+            return;
+        }
+        self.follow_t = 0.0;
+        let hwnd = match self.attach.target.lock().unwrap().clone() {
+            Some(t) if t.hwnd != 0 => t.hwnd,
+            _ => return,
+        };
+        let info = unsafe {
+            core::win::follow_target(hwnd, W as i32, H as i32)
+        };
+        if let Some((x, y, visible)) = info {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        }
+    }
+
     fn poll_scan(&mut self, ctx: &egui::Context) {
         while let Ok(r) = self.scan_rx.try_recv() {
             let changed = r.packages.len() != self.packages.len()
@@ -636,6 +672,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.follow_tick(ctx);
         self.poll_scan(ctx);
         self.poll_done(ctx);
         self.advance_animations(ctx);
@@ -872,6 +909,25 @@ impl eframe::App for App {
                                             ));
                                             let _ = core::set_always_on_top(self.always_on_top);
                                             self.toast = Some((format!("已{}置顶", if self.always_on_top { "开启" } else { "关闭" }), std::time::Instant::now()));
+                                        }
+                                    });
+                                });
+                            });
+                            ui.add_space(8.0);
+                            // 跟随窗口: 面板随被选定进程 显示/隐藏/移动
+                            row_frame.clone().show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(name("跟随窗口"));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let label = if self.follow_window { "已开启" } else { "开启" };
+                                        if chip(ui, vec2(60.0, 28.0), label, !self.follow_window).clicked() {
+                                            self.follow_window = !self.follow_window;
+                                            let _ = core::set_follow_window(self.follow_window);
+                                            self.toast = Some((format!("已{}跟随窗口", if self.follow_window { "开启" } else { "关闭" }), std::time::Instant::now()));
+                                            if !self.follow_window {
+                                                // 关闭跟随: 恢复手动模式, 确保窗口可见
+                                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                            }
                                         }
                                     });
                                 });
