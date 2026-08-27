@@ -556,7 +556,8 @@ pub mod win {
     /// 目标窗口跟随位置 (右下角优先: 面板底对齐目标底+右8; 超界左下; 夹工作区)
 
     pub unsafe fn follow_pos(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32)> {
-        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::UI::WindowsAndMessaging::{ClientToScreen, GetClientRect};
         let hwnd = HWND(hwnd as *mut _);
         if hwnd.0.is_null() {
             return None;
@@ -564,6 +565,15 @@ pub mod win {
         let mut r = RECT::default();
         if GetWindowRect(hwnd, &mut r).is_err() {
             return None;
+        }
+        // 视觉内容底 (客户区底) 做对齐基准 — 带边框窗口 GetWindowRect 底会偏几像素
+        let mut cr = RECT::default();
+        let mut client_bottom = r.bottom;
+        if GetClientRect(hwnd, &mut cr).is_ok() {
+            let mut pt = POINT { x: 0, y: cr.bottom };
+            if ClientToScreen(hwnd, &mut pt).as_bool() {
+                client_bottom = pt.y;
+            }
         }
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
@@ -576,11 +586,12 @@ pub mod win {
             RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
         };
         let w = r.right - r.left;
-        // 右下角优先: 面板底对齐目标底, 贴右 +8
-        let mut x = r.left + w + 8;
-        let mut y = r.bottom - panel_h;
+        let gap = 2; // 侧边贴近, 不悬空
+        // 右下角优先: 面板底对齐客户区底, 贴右 +gap
+        let mut x = r.left + w + gap;
+        let mut y = client_bottom - panel_h;
         if x + panel_w > work.right {
-            x = r.left - 8 - panel_w; // 放不下 -> 左下角
+            x = r.left - gap - panel_w; // 放不下 -> 左下角
         }
         x = x.max(work.left).min((work.right - panel_w).max(work.left));
         y = y.max(work.top).min((work.bottom - panel_h).max(work.top));
