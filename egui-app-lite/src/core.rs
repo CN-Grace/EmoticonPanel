@@ -531,7 +531,34 @@ pub mod win {
         Ok(())
     }
     /// 目标窗口跟随信息: (面板x, y, 目标可见?) — 贴右(+8), 超界放左, 夹工作区
-    pub unsafe fn follow_target(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32, bool)> {
+    /// 面板自身窗口句柄 (按进程+尺寸定位)
+    pub unsafe fn self_panel_hwnd() -> isize {
+        use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+        use windows::Win32::Foundation::{BOOL, LPARAM};
+        static FOUND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+        unsafe extern "system" fn cb(h: HWND, _l: LPARAM) -> BOOL {
+            let mut pid = 0u32;
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, Some(&mut pid));
+            if pid == std::process::id() {
+                let mut r = windows::Win32::Foundation::RECT::default();
+                if GetWindowRect(h, &mut r).is_ok() {
+                    let w = r.right - r.left;
+                    let hh = r.bottom - r.top;
+                    if (280..=420).contains(&w) && (380..=520).contains(&hh) {
+                        FOUND.store(h.0 as isize, std::sync::atomic::Ordering::SeqCst);
+                        return BOOL(0); // 停止
+                    }
+                }
+            }
+            BOOL(1)
+        }
+        FOUND.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = EnumWindows(Some(cb), LPARAM(0));
+        FOUND.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 目标窗口跟随位置 (贴右+8, 超界放左, 夹工作区)
+    pub unsafe fn follow_pos(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32)> {
         use windows::Win32::Foundation::RECT;
         let hwnd = HWND(hwnd as *mut _);
         if hwnd.0.is_null() {
@@ -541,7 +568,6 @@ pub mod win {
         if GetWindowRect(hwnd, &mut r).is_err() {
             return None;
         }
-        let visible = IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool();
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -560,7 +586,19 @@ pub mod win {
         }
         x = x.max(work.left);
         y = y.max(work.top).min(work.bottom - panel_h).max(work.top);
-        Some((x, y, visible))
+        Some((x, y))
+    }
+
+    /// 目标窗口是否可见 (可见且未被最小化)
+    pub unsafe fn target_visible(hwnd: isize) -> bool {
+        let hwnd = HWND(hwnd as *mut _);
+        IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool()
+    }
+
+    /// 目标窗口跟随信息: (x, y, 可见?) — 兼容旧接口
+    pub unsafe fn follow_target(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32, bool)> {
+        let (x, y) = follow_pos(hwnd, panel_w, panel_h)?;
+        Some((x, y, target_visible(hwnd)))
     }
 }
 

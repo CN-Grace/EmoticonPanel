@@ -13,6 +13,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering as AOrder};
 use std::sync::OnceLock;
 static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
+static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
+static LAST_VIS: AtomicIsize = AtomicIsize::new(1); // 1=可见
 static WATCH_CTX: OnceLock<egui::Context> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
@@ -25,13 +27,38 @@ unsafe extern "system" fn win_loc_proc(
     _tid: u32,
     _tm: u32,
 ) {
-    use windows::Win32::UI::WindowsAndMessaging::{OBJID_CLIENT, OBJID_WINDOW};
-    if hwnd.0 as isize != TARGET_HWND.load(AOrder::Relaxed) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        OBJID_CLIENT, OBJID_WINDOW, SetWindowPos, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
+        SWP_NOOWNERZORDER, SWP_ASYNCWINDOWPOS,
+    };
+    let target = TARGET_HWND.load(AOrder::Relaxed);
+    if hwnd.0 as isize != target {
         return;
     }
     if id_object == OBJID_WINDOW.0 || id_object == OBJID_CLIENT.0 {
-        if let Some(ctx) = WATCH_CTX.get() {
-            ctx.request_repaint(); // 目标动了/显隐变了 -> 立即唤醒跟随
+        // 移动/显隐变化: 系统级直接搬面板窗口 (不走 egui 渲染帧, 最跟手)
+        let mut panel = PANEL_HWND.load(AOrder::Relaxed);
+        if panel == 0 {
+            panel = core::win::self_panel_hwnd();
+            PANEL_HWND.store(panel, AOrder::Relaxed);
+        }
+        if panel != 0 {
+            if let Some((x, y)) = core::win::follow_pos(target, W as i32, H as i32) {
+                let _ = SetWindowPos(
+                    windows::Win32::Foundation::HWND(panel as *mut _),
+                    None,
+                    x, y, 0, 0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
+                );
+            }
+        }
+        // 显隐/最小化变化 -> 唤醒 UI 处理 (Minimized 命令需要 egui)
+        let vis = core::win::target_visible(target) as isize;
+        let prev = LAST_VIS.swap(vis, AOrder::Relaxed);
+        if prev != vis {
+            if let Some(ctx) = WATCH_CTX.get() {
+                ctx.request_repaint();
+            }
         }
     }
 }
@@ -348,6 +375,7 @@ impl App {
     fn follow_tick(&mut self, ctx: &egui::Context) {
         if !self.follow_window {
             TARGET_HWND.store(0, AOrder::Relaxed);
+            PANEL_HWND.store(0, AOrder::Relaxed);
             return;
         }
         let hwnd = match self.attach.target.lock().unwrap().clone() {
@@ -360,6 +388,9 @@ impl App {
         // 注册目标 + 唤醒上下文 (hook 常驻, 目标移动/显隐即 repaint)
         TARGET_HWND.store(hwnd, AOrder::Relaxed);
         let _ = WATCH_CTX.set(ctx.clone());
+        if PANEL_HWND.load(AOrder::Relaxed) == 0 {
+            PANEL_HWND.store(unsafe { core::win::self_panel_hwnd() }, AOrder::Relaxed);
+        }
         spawn_win_hook();
         // 兜底: 事件偶发丢失时 200ms 保底采样 (静止时低开销)
         ctx.request_repaint_after(Duration::from_millis(200));
