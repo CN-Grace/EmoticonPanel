@@ -8,6 +8,34 @@ use egui::{
     Rounding, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 use std::collections::HashMap;
+
+// ---- 跟随事件钩子: 目标窗口移动/显隐变化即时唤醒跟随 (事件驱动, 非固定采样) ----
+use std::sync::atomic::{AtomicIsize, Ordering as AOrder};
+use std::sync::OnceLock;
+static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
+static WATCH_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn win_loc_proc(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    hwnd: windows::Win32::Foundation::HWND,
+    id_object: i32,
+    _id_child: i32,
+    _tid: u32,
+    _tm: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{OBJID_CLIENT, OBJID_WINDOW};
+    if hwnd.0 as isize != TARGET_HWND.load(AOrder::Relaxed) {
+        return;
+    }
+    if id_object == OBJID_WINDOW.0 || id_object == OBJID_CLIENT.0 {
+        if let Some(ctx) = WATCH_CTX.get() {
+            ctx.request_repaint(); // 目标动了/显隐变了 -> 立即唤醒跟随
+        }
+    }
+}
+
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -319,16 +347,24 @@ impl App {
     /// 跟随目标进程: 面板随被选定窗口 显示/隐藏/移动 (贴靠其右侧)
     fn follow_tick(&mut self, ctx: &egui::Context) {
         if !self.follow_window {
+            TARGET_HWND.store(0, AOrder::Relaxed);
             return;
         }
         let hwnd = match self.attach.target.lock().unwrap().clone() {
             Some(t) if t.hwnd != 0 => t.hwnd,
-            _ => return, // 未绑定: 不持续重绘
+            _ => {
+                TARGET_HWND.store(0, AOrder::Relaxed);
+                return;
+            }
         };
-        // 已绑定: 持续自动重绘(100ms), 保证目标移动/恢复实时感知 (egui 闲置不重绘的坑)
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // 注册目标 + 唤醒上下文 (hook 常驻, 目标移动/显隐即 repaint)
+        TARGET_HWND.store(hwnd, AOrder::Relaxed);
+        let _ = WATCH_CTX.set(ctx.clone());
+        spawn_win_hook();
+        // 兜底: 事件偶发丢失时 200ms 保底采样 (静止时低开销)
+        ctx.request_repaint_after(Duration::from_millis(200));
         self.follow_t += ctx.input(|i| i.stable_dt as f64);
-        if self.follow_t < 0.1 {
+        if self.follow_t < 0.05 {
             return;
         }
         self.follow_t = 0.0;
@@ -1196,6 +1232,40 @@ fn clip_no_dib() {
         );
         eprintln!("[clip] formats = {names:?} (无 CF_DIB/8, 有 HDROP/15 + PNG)");
     }
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_win_hook() {
+    use std::sync::Once;
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, TranslateMessage, MSG, EVENT_OBJECT_LOCATIONCHANGE,
+        WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    };
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(move || {
+            unsafe {
+                let hook = SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(win_loc_proc),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if !hook.0.is_null() {
+                    let _ = UnhookWinEvent(hook);
+                }
+            }
+        });
+    });
 }
 
 fn main() -> eframe::Result<()> {
