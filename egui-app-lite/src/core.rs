@@ -579,13 +579,14 @@ pub mod win {
             RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
         };
         let w = r.right - r.left;
+        // 右下角优先: 面板底对齐目标底, 贴右 +8
         let mut x = r.left + w + 8;
-        let mut y = r.top;
+        let mut y = r.bottom - panel_h;
         if x + panel_w > work.right {
-            x = r.left - 8 - panel_w;
+            x = r.left - 8 - panel_w; // 放不下 -> 左下角
         }
-        x = x.max(work.left);
-        y = y.max(work.top).min(work.bottom - panel_h).max(work.top);
+        x = x.max(work.left).min((work.right - panel_w).max(work.left));
+        y = y.max(work.top).min((work.bottom - panel_h).max(work.top));
         Some((x, y))
     }
 

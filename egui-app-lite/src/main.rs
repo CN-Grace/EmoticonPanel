@@ -1163,11 +1163,23 @@ fn chip(ui: &mut egui::Ui, size: Vec2, text: &str, filled: bool) -> egui::Respon
 fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
     let mut fonts = FontDefinitions::default();
-    // 内嵌 GB2312 子集字体 (2MB, 覆盖 6692 汉字 + ASCII + 中文标点)
-    let subset: &[u8] = include_bytes!("../assets/cjk-subset.ttf");
+    // 内嵌 GBK 全量子集字体 (7MB, 覆盖 21885 汉字/符号 = 全中文, 含繁体)
+    let subset: &[u8] = include_bytes!("../assets/gbk-subset.ttf");
     fonts.font_data.insert("cjk".into(), FontData::from_owned(subset.to_vec()));
+    // 系统黑体 fallback: 子集缺字(生僻/繁体/符号/emoji)自动用系统字体, 覆盖全部
+    if let Ok(sys) = std::fs::read(r"C:\Windows\Fonts\simhei.ttf") {
+        if sys.len() > 1024 * 1024 {
+            fonts.font_data.insert("syshei".into(), FontData::from_owned(sys));
+        }
+    }
     for f in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts.families.entry(f).or_default().insert(0, "cjk".into());
+        let fam = fonts.families.entry(f).or_default();
+        if !fam.iter().any(|n| n == "cjk") {
+            fam.insert(0, "cjk".into());
+        }
+        if !fam.iter().any(|n| n == "syshei") {
+            fam.push("syshei".into()); // 次级 fallback
+        }
     }
     ctx.set_fonts(fonts);
 }
