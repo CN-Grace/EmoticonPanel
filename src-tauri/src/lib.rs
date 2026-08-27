@@ -884,7 +884,13 @@ mod follow {
                     if !ENABLED.load(A::SeqCst) { return; }
                     if hwnd.0 as isize != TARGET.load(A::SeqCst) { return; }
                     if idobj != OBJID_WINDOW.0 && idobj != OBJID_CLIENT.0 { return; }
-                    let panel = PANEL.load(A::SeqCst);
+                    let mut panel = PANEL.load(A::SeqCst);
+                    if panel == 0 {
+                        if let Some(a) = APP.get() {
+                            panel = win::panel_hwnd_from(a);
+                            PANEL.store(panel, A::SeqCst);
+                        }
+                    }
                     if panel != 0 {
                         let (pw, ph) = win::panel_size(panel);
                         if pw > 0 && ph > 0 {
@@ -896,10 +902,16 @@ mod follow {
                     let vis = win::target_visible(hwnd.0 as isize) as isize;
                     let prev = LAST_VIS.swap(vis, A::SeqCst);
                     if prev != vis {
-                        if let Some(a) = APP.get() {
-                            if let Some(w) = a.get_webview_window("main") {
-                                let _ = if vis == 1 { w.unminimize() } else { w.minimize() };
-                            }
+                        let panel = PANEL.load(A::SeqCst);
+                        if panel != 0 {
+                            // 纯 Win32 最小化/恢复 (跨线程安全, 不触发 tauri 线程限制)
+                            use windows::Win32::UI::WindowsAndMessaging::{
+                                ShowWindow, SW_RESTORE, SW_MINIMIZE,
+                            };
+                            let _ = ShowWindow(
+                                windows::Win32::Foundation::HWND(panel as *mut _),
+                                if vis == 1 { SW_RESTORE } else { SW_MINIMIZE },
+                            );
                         }
                     }
                 }
@@ -925,10 +937,11 @@ mod follow {
 /// 跟随窗口 (面板随目标进程 显示/隐藏/移动)
 #[tauri::command]
 fn get_follow_window(app: tauri::AppHandle) -> bool {
+    // 默认开启 (与 egui-lite 一致); 未配置过时视为 true
     read_settings(&app)
         .get("followWindow")
         .and_then(|a| a.as_bool())
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 #[tauri::command]
