@@ -117,20 +117,6 @@ pub fn set_follow_window(v: bool) -> Result<(), String> {
     write_settings(&s)
 }
 
-/// 始终置顶 状态
-pub fn get_always_on_top() -> bool {
-    read_settings()
-        .get("alwaysOnTop")
-        .and_then(|a| a.as_bool())
-        .unwrap_or(false)
-}
-
-pub fn set_always_on_top(v: bool) -> Result<(), String> {
-    let mut s = read_settings();
-    s["alwaysOnTop"] = serde_json::json!(v);
-    write_settings(&s)
-}
-
 pub fn list_packages(root: &Path) -> Vec<Package> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(root) else {
@@ -594,6 +580,19 @@ pub mod win {
     pub unsafe fn target_visible(hwnd: isize) -> bool {
         let hwnd = HWND(hwnd as *mut _);
         IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool()
+    }
+
+    /// 放置面板: 位置 + 同层绘制 (插到目标窗口正下方, 随目标 Z 层级)
+    pub unsafe fn place_panel(panel: isize, target: isize, x: i32, y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_NOSIZE, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS,
+        };
+        let _ = SetWindowPos(
+            HWND(panel as *mut _),
+            HWND(target as *mut _), // 目标下方 = 与目标同一绘制层级
+            x, y, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
     }
 
     /// 目标窗口跟随信息: (x, y, 可见?) — 兼容旧接口

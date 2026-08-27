@@ -27,10 +27,7 @@ unsafe extern "system" fn win_loc_proc(
     _tid: u32,
     _tm: u32,
 ) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        OBJID_CLIENT, OBJID_WINDOW, SetWindowPos, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
-        SWP_NOOWNERZORDER, SWP_ASYNCWINDOWPOS,
-    };
+    use windows::Win32::UI::WindowsAndMessaging::{OBJID_CLIENT, OBJID_WINDOW};
     let target = TARGET_HWND.load(AOrder::Relaxed);
     if hwnd.0 as isize != target {
         return;
@@ -44,12 +41,7 @@ unsafe extern "system" fn win_loc_proc(
         }
         if panel != 0 {
             if let Some((x, y)) = core::win::follow_pos(target, W as i32, H as i32) {
-                let _ = SetWindowPos(
-                    windows::Win32::Foundation::HWND(panel as *mut _),
-                    None,
-                    x, y, 0, 0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS,
-                );
+                core::win::place_panel(panel, target, x, y); // 位置 + 同层Z
             }
         }
         // 位置已系统级搬移(跟手); 同时保持帧推进, 悬浮 GIF 动画才不停滞
@@ -187,7 +179,6 @@ struct App {
     tab_cover: Vec<Option<TextureHandle>>,
     fallback: TextureHandle,
     show_settings: bool,
-    always_on_top: bool, // 设置: 窗口始终置顶
     follow_window: bool, // 设置: 面板随目标进程 显示/隐藏/移动
     follow_t: f64,
     prev_min: bool,      // 上次面板最小化状态
@@ -216,10 +207,6 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // 应用已保存的置顶状态
-        if core::get_always_on_top() {
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-        }
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         let fallback = cc
@@ -297,7 +284,6 @@ impl App {
             tab_cover: Vec::new(),
             fallback,
             show_settings: false,
-            always_on_top: core::get_always_on_top(),
             follow_window: core::get_follow_window(),
             follow_t: 0.0,
             prev_min: false,
@@ -413,7 +399,11 @@ impl App {
                 if cur_min {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+                // 保底同层放置 (事件主路径在回调, 这里低频兜底)
+                let panel = PANEL_HWND.load(AOrder::Relaxed);
+                if panel != 0 {
+                    unsafe { core::win::place_panel(panel, hwnd, x, y); }
+                }
             } else if !cur_min {
                 if self.min_cooldown > 0.0 {
                     self.min_cooldown -= 0.1;
@@ -985,24 +975,6 @@ impl eframe::App for App {
                             });
                             ui.add_space(8.0);
 
-                            // 始终置顶: 名+右切换按钮
-                            row_frame.clone().show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(name("始终置顶"));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        let label = if self.always_on_top { "已开启" } else { "开启" };
-                                        if chip(ui, vec2(60.0, 28.0), label, !self.always_on_top).clicked() {
-                                            self.always_on_top = !self.always_on_top;
-                                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                                                if self.always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal },
-                                            ));
-                                            let _ = core::set_always_on_top(self.always_on_top);
-                                            self.toast = Some((format!("已{}置顶", if self.always_on_top { "开启" } else { "关闭" }), std::time::Instant::now()));
-                                        }
-                                    });
-                                });
-                            });
-                            ui.add_space(8.0);
                             // 跟随窗口: 面板随被选定进程 显示/隐藏/移动
                             row_frame.clone().show(ui, |ui| {
                                 ui.horizontal(|ui| {
