@@ -46,8 +46,8 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   display: grid;
-  grid-template-columns: repeat(4, 79px);
-  grid-auto-rows: 97px;
+  grid-template-columns: repeat(4, 72px);
+  grid-auto-rows: 96px;
   justify-content: center;
   align-content: start;
   gap: 2px 2px;
@@ -71,8 +71,8 @@ body {
 }
 
 .stk-cell img {
-  width: 75px;
-  height: 75px;
+  width: 70px;
+  height: 70px;
   object-fit: contain;
   pointer-events: none;
 }
@@ -263,29 +263,6 @@ body {
   background: rgba(250, 140, 22, 0.08);
 }
 
-/* ---------- 预览 ---------- */
-.preview {
-  position: fixed;
-  z-index: 50;
-  pointer-events: none;
-  background: #fff;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 6px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
-  display: block;
-}
-
-.preview[hidden] {
-  display: none;
-}
-
-.preview img {
-  width: 96px;
-  height: 96px;
-  object-fit: contain;
-  display: block;
-}
 
 /* ---------- 右键菜单 ---------- */
 .ctx-menu {

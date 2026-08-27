@@ -37,8 +37,6 @@ const $ = <T extends HTMLElement>(sel: string) =>
 
 const gridArea = $("#gridArea");
 const tabsEl = $("#tabs");
-const preview = $("#preview");
-const previewImg = document.querySelector("#previewImg") as HTMLImageElement;
 const ctxMenu = $("#ctxMenu");
 const modalMask = $("#modalMask");
 const modalText = $("#modalText");
@@ -164,6 +162,25 @@ async function selectGroup(i: number) {
   renderGrid();
 }
 
+// 懒加载: 进入可视区才加载图片 (GIF 由浏览器原位自动播放)
+const lazyObs = new IntersectionObserver(
+  (entries) => {
+    for (const en of entries) {
+      if (!en.isIntersecting) continue;
+      const c = en.target as HTMLElement;
+      const p = c.dataset.path;
+      const img = c.querySelector("img") as HTMLImageElement | null;
+      if (p && img && !img.src) {
+        loadImage(p)
+          .then((d) => { if (img) img.src = d; })
+          .catch(() => {});
+      }
+      lazyObs.unobserve(c);
+    }
+  },
+  { root: gridArea, rootMargin: "120px 0px" }
+);
+
 function renderGrid() {
   gridArea.innerHTML = "";
   for (const st of state.stickers) {
@@ -172,9 +189,6 @@ function renderGrid() {
     cell.dataset.path = st.url;
     const img = document.createElement("img");
     img.alt = st.name;
-    loadImage(st.url)
-      .then((d) => (img.src = d))
-      .catch(() => {});
     const label = document.createElement("div");
     label.className = "stk-name";
     label.textContent = st.name; // 图片文件名
@@ -182,39 +196,9 @@ function renderGrid() {
     cell.appendChild(img);
     cell.appendChild(label);
     cell.addEventListener("click", () => insertSticker(st));
-    cell.addEventListener("pointerenter", (e) =>
-      showPreview(e.clientX, e.clientY, st.url)
-    );
-    cell.addEventListener("pointermove", (e) =>
-      movePreview(e.clientX, e.clientY)
-    );
-    cell.addEventListener("pointerleave", hidePreview);
     gridArea.appendChild(cell);
+    lazyObs.observe(cell); // 进入可视区再加载 (原 GIF 原位自动播放)
   }
-}
-
-// ---------- 预览 ----------
-function showPreview(x: number, y: number, path: string) {
-  preview.hidden = false;
-  loadImage(path).then((d) => {
-    if (!preview.hidden) previewImg.src = d;
-  });
-  movePreview(x, y);
-}
-
-function movePreview(x: number, y: number) {
-  const r = preview.getBoundingClientRect();
-  let left = x + 14;
-  let top = y - r.height - 8;
-  if (left + r.width > window.innerWidth) left = x - r.width - 14;
-  if (top < 4) top = y + 14;
-  preview.style.left = left + "px";
-  preview.style.top = top + "px";
-}
-
-function hidePreview() {
-  preview.hidden = true;
-  previewImg.removeAttribute("src");
 }
 
 // ---------- attach 目标窗口 (设置面板) ----------
