@@ -557,7 +557,8 @@ pub mod win {
 
     pub unsafe fn follow_pos(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32)> {
         use windows::Win32::Foundation::{POINT, RECT};
-        use windows::Win32::UI::WindowsAndMessaging::{ClientToScreen, GetClientRect};
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
         let hwnd = HWND(hwnd as *mut _);
         if hwnd.0.is_null() {
             return None;
