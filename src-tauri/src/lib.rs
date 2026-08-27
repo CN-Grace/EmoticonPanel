@@ -375,12 +375,13 @@ mod win {
     use std::path::Path;
     use tauri::Manager;
     use windows::Win32::Foundation::{CloseHandle, HWND};
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     use windows::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, IsIconic, SetForegroundWindow,
-        ShowWindow, SW_RESTORE,
+        GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
     use windows::core::PWSTR;
 
@@ -662,6 +663,77 @@ mod win {
         }
         Err("无法打开剪贴板 (可能被占用)".into())
     }
+
+    // ---- 跟随窗口: 面板随目标进程 显示/隐藏/移动 (与 egui-lite 同步) ----
+    pub unsafe fn panel_size(panel: isize) -> (i32, i32) {
+        use windows::Win32::Foundation::RECT;
+        let mut r = RECT::default();
+        if GetWindowRect(HWND(panel as *mut _), &mut r).is_ok() {
+            (r.right - r.left, r.bottom - r.top)
+        } else {
+            (0, 0)
+        }
+    }
+
+    pub unsafe fn follow_pos(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32)> {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+        let hwnd = HWND(hwnd as *mut _);
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return None;
+        }
+        let mut cr = RECT::default();
+        let mut client_bottom = r.bottom;
+        if GetClientRect(hwnd, &mut cr).is_ok() {
+            let mut pt = POINT { x: 0, y: cr.bottom };
+            if ClientToScreen(hwnd, &mut pt).as_bool() {
+                client_bottom = pt.y;
+            }
+        }
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let work = if GetMonitorInfoW(mon, &mut mi).as_bool() { mi.rcWork } else { RECT { left: 0, top: 0, right: 1920, bottom: 1080 } };
+        let w = r.right - r.left;
+        let gap = 0;
+        let mut x = r.left + w + gap;
+        let mut y = client_bottom - panel_h;
+        if x + panel_w > work.right {
+            x = r.left - gap - panel_w;
+        }
+        x = x.max(work.left).min((work.right - panel_w).max(work.left));
+        y = y.max(work.top).min((work.bottom - panel_h).max(work.top));
+        Some((x, y))
+    }
+
+    pub unsafe fn target_visible(hwnd: isize) -> bool {
+        IsWindowVisible(HWND(hwnd as *mut _)).as_bool() && !IsIconic(HWND(hwnd as *mut _)).as_bool()
+    }
+
+    pub unsafe fn place_panel(panel: isize, target: isize, x: i32, y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOSIZE, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS};
+        let _ = SetWindowPos(
+            HWND(panel as *mut _),
+            HWND(target as *mut _),
+            x, y, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+    }
+
+    pub unsafe fn panel_hwnd_from(app: &tauri::AppHandle) -> isize {
+        use tauri::Manager;
+        match app.get_webview_window("main") {
+            Some(w) => match w.hwnd() {
+                Ok(h) => h.0 as isize,
+                Err(_) => 0,
+            },
+            None => 0,
+        }
+    }
 }
 
 #[tauri::command]
@@ -690,7 +762,11 @@ fn begin_pick(app: tauri::AppHandle, state: tauri::State<AppState>) -> Result<()
             let fg = win::foreground_hwnd();
             if fg != 0 && fg != self_hwnd && fg != last {
                 if let Some(info) = win::capture_target(fg) {
-                    *target.lock().unwrap() = Some(info);
+                    *target.lock().unwrap() = Some(info.clone());
+                    #[cfg(target_os = "windows")]
+                    if follow::enabled() {
+                        follow::set_target(info.hwnd);
+                    }
                     break;
                 }
             }
@@ -764,16 +840,128 @@ fn insert_sticker(app: tauri::AppHandle, state: tauri::State<AppState>, path: St
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+#[cfg(target_os = "windows")]
+mod follow {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering as A};
+    use std::sync::OnceLock;
+    use super::win;
+    use tauri::Manager;
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static TARGET: AtomicIsize = AtomicIsize::new(0);
+    static PANEL: AtomicIsize = AtomicIsize::new(0);
+    static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+    static LAST_VIS: AtomicIsize = AtomicIsize::new(1);
+
+    pub fn enabled() -> bool { ENABLED.load(A::SeqCst) }
+    pub fn set_target(hwnd: isize) { TARGET.store(hwnd, A::SeqCst); }
+
+    pub fn start(app: tauri::AppHandle) {
+        ENABLED.store(true, A::SeqCst);
+        let _ = APP.set(app.clone());
+        if PANEL.load(A::SeqCst) == 0 {
+            PANEL.store(unsafe { win::panel_hwnd_from(&app) }, A::SeqCst);
+        }
+        start_hook();
+    }
+
+    pub fn stop() { ENABLED.store(false, A::SeqCst); }
+
+    fn start_hook() {
+        use std::sync::Once;
+        use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, GetMessageW, TranslateMessage, MSG, EVENT_OBJECT_LOCATIONCHANGE,
+            WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, OBJID_CLIENT, OBJID_WINDOW,
+        };
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            std::thread::spawn(move || {
+                unsafe extern "system" fn proc(
+                    _h: HWINEVENTHOOK, _e: u32, hwnd: windows::Win32::Foundation::HWND,
+                    idobj: i32, _ic: i32, _t: u32, _tm: u32,
+                ) {
+                    if !ENABLED.load(A::SeqCst) { return; }
+                    if hwnd.0 as isize != TARGET.load(A::SeqCst) { return; }
+                    if idobj != OBJID_WINDOW.0 && idobj != OBJID_CLIENT.0 { return; }
+                    let panel = PANEL.load(A::SeqCst);
+                    if panel != 0 {
+                        let (pw, ph) = win::panel_size(panel);
+                        if pw > 0 && ph > 0 {
+                            if let Some((x, y)) = win::follow_pos(hwnd.0 as isize, pw, ph) {
+                                win::place_panel(panel, hwnd.0 as isize, x, y);
+                            }
+                        }
+                    }
+                    let vis = win::target_visible(hwnd.0 as isize) as isize;
+                    let prev = LAST_VIS.swap(vis, A::SeqCst);
+                    if prev != vis {
+                        if let Some(a) = APP.get() {
+                            if let Some(w) = a.get_webview_window("main") {
+                                let _ = if vis == 1 { w.unminimize() } else { w.minimize() };
+                            }
+                        }
+                    }
+                }
+                let hook = unsafe {
+                    SetWinEventHook(
+                        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None,
+                        Some(proc), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                    )
+                };
+                let mut msg = MSG::default();
+                unsafe {
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    if !hook.0.is_null() { let _ = UnhookWinEvent(hook); }
+                }
+            });
+        });
+    }
+}
+
+/// 跟随窗口 (面板随目标进程 显示/隐藏/移动)
+#[tauri::command]
+fn get_follow_window(app: tauri::AppHandle) -> bool {
+    read_settings(&app)
+        .get("followWindow")
+        .and_then(|a| a.as_bool())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_follow_window(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    let mut v = read_settings(&app);
+    v["followWindow"] = serde_json::json!(on);
+    write_settings(&app, &v)?;
+    if on {
+        follow::start(app);
+    } else {
+        follow::stop();
+    }
+    Ok(())
+}
+
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
+        .setup(|app| {
+            #[cfg(target_os = "windows")]
+            if get_follow_window(app.handle().clone()) {
+                let _ = set_follow_window(app.handle().clone(), true);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_root,
             set_stickers_dir,
-            get_always_on_top,
-            set_always_on_top,
+            get_follow_window,
+            set_follow_window,
             list_packages,
             list_stickers,
             read_sticker,

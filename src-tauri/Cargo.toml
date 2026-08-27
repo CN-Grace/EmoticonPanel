@@ -27,6 +27,8 @@ image = { version = "0.25", default-features = true }
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_Accessibility",
   "Win32_System_DataExchange",
   "Win32_System_Memory",
   "Win32_System_Threading",

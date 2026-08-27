@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 interface StickerInfo {
@@ -46,8 +45,8 @@ const modalText = $("#modalText");
 const toast = $("#toast");
 const settings = $("#settings");
 const setLocationVal = $("#setLocationVal");
-const setAotVal = $("#setAotVal");
-const setAotBtn = $("#setAotBtn");
+const setFollowVal = $("#setFollowVal");
+const setFollowBtn = $("#setFollowBtn");
 
 // ---------- 基础工具 ----------
 let toastTimer: number | undefined;
@@ -303,32 +302,26 @@ $("#setRefreshBtn").addEventListener("click", () => {
   loadAll().then(() => showToast("已刷新表情包"));
 });
 
-// 始终置顶: 读取持久化状态并切换
-let aot = false;
-async function initAot() {
+// 跟随窗口: 面板随被选定进程 显示/隐藏/移动 (后端 WinEventHook + 同层Z)
+let follow = false;
+async function initFollow() {
   try {
-    aot = await invoke<boolean>("get_always_on_top");
+    follow = await invoke<boolean>("get_follow_window");
   } catch {
-    aot = false;
+    follow = false;
   }
-  setAotVal.textContent = aot ? "开启" : "关闭";
-  setAotBtn.textContent = aot ? "已开启" : "开启";
-  if (aot) {
-    try {
-      await getCurrentWindow().setAlwaysOnTop(true);
-    } catch { /* 忽略 */ }
-  }
+  setFollowVal.textContent = follow ? "开启" : "关闭";
+  setFollowBtn.textContent = follow ? "已开启" : "开启";
 }
-$("#setAotBtn").addEventListener("click", async () => {
-  aot = !aot;
-  setAotVal.textContent = aot ? "开启" : "关闭";
-  setAotBtn.textContent = aot ? "已开启" : "开启";
+$("#setFollowBtn").addEventListener("click", async () => {
+  follow = !follow;
   try {
-    await getCurrentWindow().setAlwaysOnTop(aot);
-    await invoke("set_always_on_top", { on: aot });
-    showToast(aot ? "已开启置顶" : "已关闭置顶");
+    await invoke("set_follow_window", { on: follow });
+    setFollowVal.textContent = follow ? "开启" : "关闭";
+    setFollowBtn.textContent = follow ? "已开启" : "开启";
+    showToast(follow ? "已开启跟随窗口" : "已关闭跟随窗口");
   } catch (e) {
-    showToast("置顶设置失败: " + e);
+    showToast("设置失败: " + e);
   }
 });
 
@@ -400,4 +393,4 @@ function showCtxMenu(x: number, y: number, idx: number) {
 window.addEventListener("DOMContentLoaded", () => {
   loadAll();
 });
-initAot();
+initFollow();
