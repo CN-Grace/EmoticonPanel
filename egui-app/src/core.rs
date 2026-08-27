@@ -117,20 +117,6 @@ pub fn set_follow_window(v: bool) -> Result<(), String> {
     write_settings(&s)
 }
 
-/// 始终置顶 状态
-pub fn get_always_on_top() -> bool {
-    read_settings()
-        .get("alwaysOnTop")
-        .and_then(|a| a.as_bool())
-        .unwrap_or(false)
-}
-
-pub fn set_always_on_top(v: bool) -> Result<(), String> {
-    let mut s = read_settings();
-    s["alwaysOnTop"] = serde_json::json!(v);
-    write_settings(&s)
-}
-
 pub fn list_packages(root: &Path) -> Vec<Package> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(root) else {
@@ -531,8 +517,48 @@ pub mod win {
         Ok(())
     }
     /// 目标窗口跟随信息: (面板x, y, 目标可见?) — 贴右(+8), 超界放左, 夹工作区
-    pub unsafe fn follow_target(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32, bool)> {
-        use windows::Win32::Foundation::RECT;
+    /// 面板自身窗口句柄 (按进程+尺寸定位)
+    pub unsafe fn self_panel_hwnd() -> isize {
+        use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+        use windows::Win32::Foundation::{BOOL, LPARAM};
+        static FOUND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+        unsafe extern "system" fn cb(h: HWND, _l: LPARAM) -> BOOL {
+            let mut pid = 0u32;
+            let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(h, Some(&mut pid));
+            if pid == std::process::id() {
+                let mut r = windows::Win32::Foundation::RECT::default();
+                if GetWindowRect(h, &mut r).is_ok() {
+                    let w = r.right - r.left;
+                    let hh = r.bottom - r.top;
+                    if (280..=420).contains(&w) && (380..=520).contains(&hh) {
+                        FOUND.store(h.0 as isize, std::sync::atomic::Ordering::SeqCst);
+                        return BOOL(0); // 停止
+                    }
+                }
+            }
+            BOOL(1)
+        }
+        FOUND.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = EnumWindows(Some(cb), LPARAM(0));
+        FOUND.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 面板实际尺寸 (物理像素, 含DPI缩放)
+    pub unsafe fn panel_size(panel: isize) -> (i32, i32) {
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(HWND(panel as *mut _), &mut r).is_ok() {
+            (r.right - r.left, r.bottom - r.top)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// 目标窗口跟随位置 (右下角优先: 面板底对齐目标底+右8; 超界左下; 夹工作区)
+
+    pub unsafe fn follow_pos(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32)> {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
         let hwnd = HWND(hwnd as *mut _);
         if hwnd.0.is_null() {
             return None;
@@ -541,7 +567,15 @@ pub mod win {
         if GetWindowRect(hwnd, &mut r).is_err() {
             return None;
         }
-        let visible = IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool();
+        // 视觉内容底 (客户区底) 做对齐基准 — 带边框窗口 GetWindowRect 底会偏几像素
+        let mut cr = RECT::default();
+        let mut client_bottom = r.bottom;
+        if GetClientRect(hwnd, &mut cr).is_ok() {
+            let mut pt = POINT { x: 0, y: cr.bottom };
+            if ClientToScreen(hwnd, &mut pt).as_bool() {
+                client_bottom = pt.y;
+            }
+        }
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -553,14 +587,41 @@ pub mod win {
             RECT { left: 0, top: 0, right: 1920, bottom: 1080 }
         };
         let w = r.right - r.left;
-        let mut x = r.left + w + 8;
-        let mut y = r.top;
+        let gap = 0; // 侧边 0 间距, 紧贴
+        // 右下角优先: 面板底对齐客户区底, 贴右 +gap
+        let mut x = r.left + w + gap;
+        let mut y = client_bottom - panel_h;
         if x + panel_w > work.right {
-            x = r.left - 8 - panel_w;
+            x = r.left - gap - panel_w; // 放不下 -> 左下角
         }
-        x = x.max(work.left);
-        y = y.max(work.top).min(work.bottom - panel_h).max(work.top);
-        Some((x, y, visible))
+        x = x.max(work.left).min((work.right - panel_w).max(work.left));
+        y = y.max(work.top).min((work.bottom - panel_h).max(work.top));
+        Some((x, y))
+    }
+
+    /// 目标窗口是否可见 (可见且未被最小化)
+    pub unsafe fn target_visible(hwnd: isize) -> bool {
+        let hwnd = HWND(hwnd as *mut _);
+        IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool()
+    }
+
+    /// 放置面板: 位置 + 同层绘制 (插到目标窗口正下方, 随目标 Z 层级)
+    pub unsafe fn place_panel(panel: isize, target: isize, x: i32, y: i32) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_NOSIZE, SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS,
+        };
+        let _ = SetWindowPos(
+            HWND(panel as *mut _),
+            HWND(target as *mut _), // 目标下方 = 与目标同一绘制层级
+            x, y, 0, 0,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+        );
+    }
+
+    /// 目标窗口跟随信息: (x, y, 可见?) — 兼容旧接口
+    pub unsafe fn follow_target(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32, bool)> {
+        let (x, y) = follow_pos(hwnd, panel_w, panel_h)?;
+        Some((x, y, target_visible(hwnd)))
     }
 }
 
@@ -643,4 +704,21 @@ pub fn insert_sticker(attach: &Attach, root: &Path, path: &Path) -> Result<(), S
     }
     win::activate_and_paste(target.hwnd)?;
     Ok(())
+}
+
+/// 后台全量扫描: 返回所有分组 + 每组贴图列表 (一次性完成, 不在 UI 线程执行)
+pub struct ScanResult {
+    pub packages: Vec<Package>,
+    pub entries: std::collections::HashMap<String, Vec<Sticker>>,
+}
+
+pub fn scan_all(root: &Path) -> ScanResult {
+    let packages = list_packages(root);
+    let mut entries = std::collections::HashMap::new();
+    for p in &packages {
+        if let Ok(ss) = list_stickers(root, &p.name) {
+            entries.insert(p.name.clone(), ss);
+        }
+    }
+    ScanResult { packages, entries }
 }

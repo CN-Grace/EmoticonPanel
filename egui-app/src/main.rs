@@ -9,6 +9,59 @@ use egui::{
     Rounding, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 use std::collections::HashMap;
+
+// ---- 跟随事件钩子: 目标窗口移动/显隐变化即时唤醒跟随 (事件驱动, 非固定采样) ----
+use std::sync::atomic::{AtomicIsize, Ordering as AOrder};
+use std::sync::OnceLock;
+static TARGET_HWND: AtomicIsize = AtomicIsize::new(0);
+static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
+static LAST_VIS: AtomicIsize = AtomicIsize::new(1);
+static WATCH_CTX: OnceLock<egui::Context> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn win_loc_proc(
+    _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    _event: u32,
+    hwnd: windows::Win32::Foundation::HWND,
+    id_object: i32,
+    _id_child: i32,
+    _tid: u32,
+    _tm: u32,
+) {
+    use windows::Win32::UI::WindowsAndMessaging::{OBJID_CLIENT, OBJID_WINDOW};
+    let target = TARGET_HWND.load(AOrder::Relaxed);
+    if hwnd.0 as isize != target {
+        return;
+    }
+    if id_object == OBJID_WINDOW.0 || id_object == OBJID_CLIENT.0 {
+        let mut panel = PANEL_HWND.load(AOrder::Relaxed);
+        if panel == 0 {
+            panel = core::win::self_panel_hwnd();
+            PANEL_HWND.store(panel, AOrder::Relaxed);
+        }
+        if panel != 0 {
+            let (pw, ph) = core::win::panel_size(panel);
+            if pw > 0 && ph > 0 {
+                if let Some((x, y)) = core::win::follow_pos(target, pw, ph) {
+                    core::win::place_panel(panel, target, x, y); // 位置 + 同层Z
+                }
+            }
+        }
+        // 保持帧推进, 悬浮 GIF 动画不停滞
+        if let Some(ctx) = WATCH_CTX.get() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        // 显隐/最小化变化 -> 唤醒 UI 处理
+        let vis = core::win::target_visible(target) as isize;
+        let prev = LAST_VIS.swap(vis, AOrder::Relaxed);
+        if prev != vis {
+            if let Some(ctx) = WATCH_CTX.get() {
+                ctx.request_repaint();
+            }
+        }
+    }
+}
+
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -108,7 +161,6 @@ struct App {
     tab_cover: Vec<Option<TextureHandle>>,
     fallback: TextureHandle,
     show_settings: bool,
-    always_on_top: bool, // 设置: 窗口始终置顶
     follow_window: bool, // 设置: 跟随目标进程 显示/隐藏/移动
     follow_t: f64,
     prev_min: bool,      // 上次面板最小化状态
@@ -129,9 +181,6 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        if core::get_always_on_top() {
-            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-        }
         install_fonts(&cc.egui_ctx);
         cc.egui_ctx.set_visuals(egui::Visuals::light());
         let fallback = cc
@@ -175,7 +224,6 @@ impl App {
             tab_cover: Vec::new(),
             fallback,
             show_settings: false,
-            always_on_top: core::get_always_on_top(),
             follow_window: core::get_follow_window(),
             follow_t: 0.0,
             prev_min: false,
@@ -227,15 +275,26 @@ impl App {
     /// 跟随目标进程: 面板随被选定窗口 显示/隐藏/移动 (贴靠其右侧)
     fn follow_tick(&mut self, ctx: &egui::Context) {
         if !self.follow_window {
+            TARGET_HWND.store(0, AOrder::Relaxed);
+            PANEL_HWND.store(0, AOrder::Relaxed);
             return;
         }
         let hwnd = match self.attach.target.lock().unwrap().clone() {
             Some(t) if t.hwnd != 0 => t.hwnd,
-            _ => return,
+            _ => {
+                TARGET_HWND.store(0, AOrder::Relaxed);
+                return;
+            }
         };
-        ctx.request_repaint_after(Duration::from_millis(100));
+        TARGET_HWND.store(hwnd, AOrder::Relaxed);
+        let _ = WATCH_CTX.set(ctx.clone());
+        if PANEL_HWND.load(AOrder::Relaxed) == 0 {
+            PANEL_HWND.store(unsafe { core::win::self_panel_hwnd() }, AOrder::Relaxed);
+        }
+        spawn_win_hook();
+        ctx.request_repaint_after(Duration::from_millis(200));
         self.follow_t += ctx.input(|i| i.stable_dt as f64);
-        if self.follow_t < 0.1 {
+        if self.follow_t < 0.05 {
             return;
         }
         self.follow_t = 0.0;
@@ -249,7 +308,15 @@ impl App {
                 if cur_min {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+                let panel = PANEL_HWND.load(AOrder::Relaxed);
+                if panel != 0 {
+                    let (pw, ph) = unsafe { core::win::panel_size(panel) };
+                    if pw > 0 && ph > 0 {
+                        if let Some((px, py)) = unsafe { core::win::follow_pos(hwnd, pw, ph) } {
+                            unsafe { core::win::place_panel(panel, hwnd, px, py); }
+                        }
+                    }
+                }
             } else if !cur_min {
                 if self.min_cooldown > 0.0 {
                     self.min_cooldown -= 0.1;
@@ -707,27 +774,10 @@ impl eframe::App for App {
                                             let _ = core::set_follow_window(self.follow_window);
                                             self.toast = Some((format!("已{}跟随窗口", if self.follow_window { "开启" } else { "关闭" }), std::time::Instant::now()));
                                             if !self.follow_window {
+                                                TARGET_HWND.store(0, AOrder::Relaxed);
+                                                PANEL_HWND.store(0, AOrder::Relaxed);
                                                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                                             }
-                                        }
-                                    });
-                                });
-                            });
-                            ui.add_space(8.0);
-
-                            // 始终置顶: 名+右切换按钮
-                            row_frame.clone().show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(name("始终置顶"));
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        let label = if self.always_on_top { "已开启" } else { "开启" };
-                                        if chip(ui, vec2(60.0, 28.0), label, !self.always_on_top).clicked() {
-                                            self.always_on_top = !self.always_on_top;
-                                            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-                                                if self.always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal },
-                                            ));
-                                            let _ = core::set_always_on_top(self.always_on_top);
-                                            self.toast = Some((format!("已{}置顶", if self.always_on_top { "开启" } else { "关闭" }), std::time::Instant::now()));
                                         }
                                     });
                                 });
@@ -874,22 +924,59 @@ fn chip(ui: &mut egui::Ui, size: Vec2, text: &str, filled: bool) -> egui::Respon
 fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
     let mut fonts = FontDefinitions::default();
-    for c in [
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\Deng.ttf",
-        r"C:\Windows\Fonts\Dengb.ttf",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simsun.ttc",
-    ] {
-        if let Ok(bytes) = std::fs::read(c) {
-            fonts.font_data.insert("cjk".into(), FontData::from_owned(bytes));
-            for f in [FontFamily::Proportional, FontFamily::Monospace] {
-                fonts.families.entry(f).or_default().insert(0, "cjk".into());
-            }
-            break;
+    // 内嵌 GBK 全量子集字体 (7MB, 覆盖 21885 汉字/符号 = 全中文, 含繁体)
+    let subset: &[u8] = include_bytes!("../assets/gbk-subset.ttf");
+    fonts.font_data.insert("cjk".into(), FontData::from_owned(subset.to_vec()));
+    // 系统黑体 fallback: 子集缺字自动用系统字体
+    if let Ok(sys) = std::fs::read(r"C:\Windows\Fonts\simhei.ttf") {
+        if sys.len() > 1024 * 1024 {
+            fonts.font_data.insert("syshei".into(), FontData::from_owned(sys));
+        }
+    }
+    for f in [FontFamily::Proportional, FontFamily::Monospace] {
+        let fam = fonts.families.entry(f).or_default();
+        if !fam.iter().any(|n| n == "cjk") {
+            fam.insert(0, "cjk".into());
+        }
+        if !fam.iter().any(|n| n == "syshei") {
+            fam.push("syshei".into());
         }
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_win_hook() {
+    use std::sync::Once;
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, TranslateMessage, MSG, EVENT_OBJECT_LOCATIONCHANGE,
+        WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    };
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::thread::spawn(move || {
+            unsafe {
+                let hook = SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    None,
+                    Some(win_loc_proc),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                );
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if !hook.0.is_null() {
+                    let _ = UnhookWinEvent(hook);
+                }
+            }
+        });
+    });
 }
 
 fn main() -> eframe::Result<()> {
