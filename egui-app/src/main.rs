@@ -109,6 +109,8 @@ struct App {
     fallback: TextureHandle,
     show_settings: bool,
     always_on_top: bool, // 设置: 窗口始终置顶
+    follow_window: bool, // 设置: 跟随目标进程 显示/隐藏/移动
+    follow_t: f64,
     menu: Option<(Pos2, usize)>, // 右键菜单位置 + 分组索引
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -172,6 +174,8 @@ impl App {
             fallback,
             show_settings: false,
             always_on_top: core::get_always_on_top(),
+            follow_window: core::get_follow_window(),
+            follow_t: 0.0,
             menu: None,
             toast: None,
             folder_rx: None,
@@ -216,6 +220,28 @@ impl App {
     }
 
     /// 每帧: 收 worker 完成结果, 主线程创建纹理
+    /// 跟随目标进程: 面板随被选定窗口 显示/隐藏/移动 (贴靠其右侧)
+    fn follow_tick(&mut self, ctx: &egui::Context) {
+        if !self.follow_window {
+            return;
+        }
+        self.follow_t += ctx.input(|i| i.stable_dt as f64);
+        if self.follow_t < 0.2 {
+            return;
+        }
+        self.follow_t = 0.0;
+        let hwnd = match self.attach.target.lock().unwrap().clone() {
+            Some(t) if t.hwnd != 0 => t.hwnd,
+            _ => return,
+        };
+        if let Some((x, y, visible)) = unsafe {
+            core::win::follow_target(hwnd, W as i32, H as i32)
+        } {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        }
+    }
+
     fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
         while got < 24 {
@@ -430,6 +456,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.follow_tick(ctx);
         self.poll_done(ctx);
         self.advance_animations(ctx);
         if self.attach.picking.load(std::sync::atomic::Ordering::SeqCst) {
@@ -646,6 +673,25 @@ impl eframe::App for App {
                                         if chip(ui, vec2(56.0, 28.0), "刷新", false).clicked() {
                                             self.refresh(ctx);
                                             self.toast = Some(("已刷新表情包".into(), std::time::Instant::now()));
+                                        }
+                                    });
+                                });
+                            });
+                            ui.add_space(8.0);
+
+                            // 跟随窗口: 面板随被选定进程 显示/隐藏/移动
+                            row_frame.clone().show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(name("跟随窗口"));
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        let label = if self.follow_window { "已开启" } else { "开启" };
+                                        if chip(ui, vec2(60.0, 28.0), label, !self.follow_window).clicked() {
+                                            self.follow_window = !self.follow_window;
+                                            let _ = core::set_follow_window(self.follow_window);
+                                            self.toast = Some((format!("已{}跟随窗口", if self.follow_window { "开启" } else { "关闭" }), std::time::Instant::now()));
+                                            if !self.follow_window {
+                                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                            }
                                         }
                                     });
                                 });
