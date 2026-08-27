@@ -111,6 +111,8 @@ struct App {
     always_on_top: bool, // 设置: 窗口始终置顶
     follow_window: bool, // 设置: 跟随目标进程 显示/隐藏/移动
     follow_t: f64,
+    prev_min: bool,      // 上次面板最小化状态
+    min_cooldown: f64,   // 用户手动恢复冷却
     menu: Option<(Pos2, usize)>, // 右键菜单位置 + 分组索引
     toast: Option<(String, std::time::Instant)>,
     folder_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -176,6 +178,8 @@ impl App {
             always_on_top: core::get_always_on_top(),
             follow_window: core::get_follow_window(),
             follow_t: 0.0,
+            prev_min: false,
+            min_cooldown: 0.0,
             menu: None,
             toast: None,
             folder_rx: None,
@@ -225,23 +229,36 @@ impl App {
         if !self.follow_window {
             return;
         }
-        self.follow_t += ctx.input(|i| i.stable_dt as f64);
-        if self.follow_t < 0.2 {
-            return;
-        }
-        self.follow_t = 0.0;
         let hwnd = match self.attach.target.lock().unwrap().clone() {
             Some(t) if t.hwnd != 0 => t.hwnd,
             _ => return,
         };
-        if let Some((x, y, visible)) = unsafe {
-            core::win::follow_target(hwnd, W as i32, H as i32)
-        } {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        ctx.request_repaint_after(Duration::from_millis(100));
+        self.follow_t += ctx.input(|i| i.stable_dt as f64);
+        if self.follow_t < 0.1 {
+            return;
+        }
+        self.follow_t = 0.0;
+        let cur_min = ctx.input(|i| i.viewport().minimized).unwrap_or(false);
+        if !cur_min && self.prev_min {
+            self.min_cooldown = 3.0;
+        }
+        self.prev_min = cur_min;
+        if let Some((x, y, visible)) = unsafe { core::win::follow_target(hwnd, W as i32, H as i32) } {
+            if visible {
+                if cur_min {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x as f32, y as f32)));
+            } else if !cur_min {
+                if self.min_cooldown > 0.0 {
+                    self.min_cooldown -= 0.1;
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+            }
         }
     }
-
     fn poll_done(&mut self, ctx: &egui::Context) {
         let mut got = 0;
         while got < 24 {
@@ -690,7 +707,7 @@ impl eframe::App for App {
                                             let _ = core::set_follow_window(self.follow_window);
                                             self.toast = Some((format!("已{}跟随窗口", if self.follow_window { "开启" } else { "关闭" }), std::time::Instant::now()));
                                             if !self.follow_window {
-                                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                                                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                                             }
                                         }
                                     });
