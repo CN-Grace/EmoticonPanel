@@ -40,8 +40,11 @@ unsafe extern "system" fn win_loc_proc(
             PANEL_HWND.store(panel, AOrder::Relaxed);
         }
         if panel != 0 {
-            if let Some((x, y)) = core::win::follow_pos(target, W as i32, H as i32) {
-                core::win::place_panel(panel, target, x, y); // 位置 + 同层Z
+            let (pw, ph) = core::win::panel_size(panel);
+            if pw > 0 && ph > 0 {
+                if let Some((x, y)) = core::win::follow_pos(target, pw, ph) {
+                    core::win::place_panel(panel, target, x, y); // 位置 + 同层Z
+                }
             }
         }
         // 位置已系统级搬移(跟手); 同时保持帧推进, 悬浮 GIF 动画才不停滞
@@ -402,7 +405,12 @@ impl App {
                 // 保底同层放置 (事件主路径在回调, 这里低频兜底)
                 let panel = PANEL_HWND.load(AOrder::Relaxed);
                 if panel != 0 {
-                    unsafe { core::win::place_panel(panel, hwnd, x, y); }
+                    let (pw, ph) = unsafe { core::win::panel_size(panel) };
+                    if pw > 0 && ph > 0 {
+                        if let Some((px, py)) = unsafe { core::win::follow_pos(hwnd, pw, ph) } {
+                            unsafe { core::win::place_panel(panel, hwnd, px, py); }
+                        }
+                    }
                 }
             } else if !cur_min {
                 if self.min_cooldown > 0.0 {

@@ -543,7 +543,18 @@ pub mod win {
         FOUND.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 目标窗口跟随位置 (贴右+8, 超界放左, 夹工作区)
+    /// 面板实际尺寸 (物理像素, 含DPI缩放)
+    pub unsafe fn panel_size(panel: isize) -> (i32, i32) {
+        let mut r = windows::Win32::Foundation::RECT::default();
+        if GetWindowRect(HWND(panel as *mut _), &mut r).is_ok() {
+            (r.right - r.left, r.bottom - r.top)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// 目标窗口跟随位置 (右下角优先: 面板底对齐目标底+右8; 超界左下; 夹工作区)
+
     pub unsafe fn follow_pos(hwnd: isize, panel_w: i32, panel_h: i32) -> Option<(i32, i32)> {
         use windows::Win32::Foundation::RECT;
         let hwnd = HWND(hwnd as *mut _);
